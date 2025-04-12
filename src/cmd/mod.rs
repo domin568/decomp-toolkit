@@ -8,6 +8,7 @@ pub mod elf;
 pub mod elf2dol;
 pub mod map;
 pub mod nlzss;
+pub mod pef;
 pub mod rarc;
 pub mod rel;
 pub mod rso;
