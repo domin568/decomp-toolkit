@@ -1,8 +1,5 @@
 use std::{
-    cmp::min,
-    collections::BTreeMap,
-    fmt::{Debug, Display, Formatter, UpperHex},
-    ops::{Add, AddAssign, BitAnd, Sub},
+    cmp::min, collections::BTreeMap, fmt::{Debug, Display, Formatter, UpperHex}, mem, ops::{Add, AddAssign, BitAnd, Sub}
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -10,16 +7,13 @@ use itertools::Itertools;
 
 use crate::{
     analysis::{
-        executor::{ExecCbData, ExecCbResult, Executor},
-        skip_alignment,
-        slices::{FunctionSlices, TailCallResult},
-        vm::{BranchTarget, GprValue, StepResult, VM},
-        RelocationTarget,
+        executor::{ExecCbData, ExecCbResult, Executor}, skip_alignment, slices::{FunctionSlices, TailCallResult}, vm::{BranchTarget, GprValue, StepResult, VM}, RelocationTarget
     },
     obj::{
         ObjInfo, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
         SectionIndex,
     },
+    util::tbtab::{ TracebackTable },
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -473,11 +467,24 @@ impl AnalyzerState {
                         if first_end > second {
                             bail!("Overlapping functions {}-{} -> {}", first, first_end, second);
                         }
-                        let addr = match skip_alignment(section, first_end, second) {
+                        let mut addr = match skip_alignment(section, first_end, second) {
                             Some(addr) => addr,
                             None => continue,
                         };
                         if second > addr {
+                            // if (pef_flag)
+                            let potential_tb_offset = first_end.address as usize - section.address as usize;
+                            let potential_tb = TracebackTable::read(&section.data, potential_tb_offset);
+                            if let Some(tb) = potential_tb {
+                                log::trace!("first {:#010X} second {:#010X}", first.address, second.address);
+                                let after_tb_off = first_end.address as usize + tb.size();
+                                if (after_tb_off == second.address as usize) {
+                                    continue;
+                                }
+                                else {
+                                    addr = SectionAddress{ section: section_index, address: after_tb_off as u32 };
+                                }
+                            }
                             log::trace!(
                                 "Trying function @ {:#010X} (from {:#010X}-{:#010X} <-> {:#010X}-{:#010X?})",
                                 addr,
