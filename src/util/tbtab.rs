@@ -48,7 +48,7 @@ pub enum OnConditionDirective {
     InvokeOnCond =	2,	/* Invoke a specific system routine */
 }
 
-#[repr(C, packed)]
+#[derive(Debug, Clone)]
 pub struct TracebackTableShort {
     reserved:                  i32, // always 0
     type_:                     u8,  // traceback format version, should be 0
@@ -63,7 +63,6 @@ pub struct TracebackTableShort {
 
 impl TracebackTableShort {
     // flags1
-    // TODO, for little endian
     const GLOBAL_LINKAGE:              u8 = 0b1000_0000; // Set if routine is global linkage
     const OUT_OF_LINE_EPILOG_PRO:      u8 = 0b0100_0000; // Set if is out-of-line epilog/prologue 
     const HAS_TB_TABLE_OFFSET:         u8 = 0b0010_0000; // Set if offset from start of proc stored
@@ -94,6 +93,7 @@ impl TracebackTableShort {
     // flags5
     const FP_PARMS_MASK:               u8 = 0b1111_1110; // Number of floating point parameters
     const PARMS_ON_STACK:              u8 = 0b0000_0001; // Set if all parameters placed on stack
+    const SIZE:                     usize = 12; // instead of repr packed, to include it in FunctionInfo with Debug trait
 
     // tb_offset is offset inside section_data
     pub fn read(tb_data: &[u8]) -> anyhow::Result<Self> {
@@ -112,7 +112,7 @@ impl TracebackTableShort {
     }
 
     pub fn size() -> usize {
-        std::mem::size_of::<Self>()
+        Self::SIZE
     }
 
     pub fn language(&self) -> Result<Language> {
@@ -159,7 +159,8 @@ impl TracebackTableShort {
 }
 
 /// more info at retro68/gcc/gcc/config/rs6000/rs6000-logue.cc
-#[repr(C, packed)]
+/// also debug.h in AIX 4+ OS src code
+#[derive(Debug, Clone)]
 pub struct TracebackTable {
     pub short:                     TracebackTableShort,
     pub parm_info:                 Option<u32>,     // Order and type encoding of parameters:
@@ -224,10 +225,6 @@ impl TracebackTable {
                 })
             })
             .flatten();
-
-        if let Some(ref name) = name_ {
-            log::trace!("{}", name);
-        }
         
         let alloca_reg_ = short_tb.uses_alloca()
             .then(|| ext_tb_cur.read_i8().ok())

@@ -46,10 +46,11 @@ fn info(args: InfoArgs) -> Result<()> {
     let mut state = AnalyzerState::default();
     //FindSaveRestSleds::execute(&mut state, &obj)?;
     state.detect_functions(&obj)?;
+    state.apply(&mut obj)?;
     for (addr, _) in state.functions.iter()
     {
         log::debug!(
-            "{:#010X}", addr.address
+            "{:#010X}", addr.address, 
         );
     }
     log::debug!(

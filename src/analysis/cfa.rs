@@ -93,6 +93,7 @@ pub struct FunctionInfo {
     pub analyzed: bool,
     pub end: Option<SectionAddress>,
     pub slices: Option<FunctionSlices>,
+    pub tbtab: Option<TracebackTable>,
 }
 
 impl FunctionInfo {
@@ -108,6 +109,10 @@ impl FunctionInfo {
 
     pub fn is_unfinalized(&self) -> bool {
         self.analyzed && self.end.is_none() && self.slices.is_some()
+    }
+
+    pub fn has_traceback_table(&self) -> bool {
+        self.tbtab.is_some()
     }
 }
 
@@ -125,8 +130,8 @@ impl AnalyzerState {
         for (&section_index, section_name) in &self.known_sections {
             obj.sections[section_index].rename(section_name.clone())?;
         }
-        for (&start, FunctionInfo { end, .. }) in self.functions.iter() {
-            let Some(end) = end else { continue };
+        for (&start, fnc_info ) in self.functions.iter() {
+            let Some(end) = fnc_info.end else { continue };
             let section = &obj.sections[start.section];
             ensure!(
                 section.contains_range(start.address..end.address),
@@ -137,11 +142,18 @@ impl AnalyzerState {
                 section.address,
                 section.address + section.size
             );
-            let name = if obj.module_id == 0 {
-                format!("fn_{:08X}", start.address)
-            } else {
-                format!("fn_{}_{:X}", obj.module_id, start.address)
-            };
+            let name = fnc_info
+                .tbtab
+                .as_ref()
+                .and_then(|tb| tb.name.clone())
+                .unwrap_or_else(|| {
+                    if obj.module_id == 0 {
+                        format!("fn_{:08X}", start.address)
+                    } else {
+                        format!("fn_{}_{:X}", obj.module_id, start.address)
+                    }
+                });
+
             obj.add_symbol(
                 ObjSymbol {
                     name,
@@ -241,6 +253,7 @@ impl AnalyzerState {
                 analyzed: false,
                 end: size.map(|size| addr + size),
                 slices: None,
+                tbtab: None,
             });
         }
         // Apply known functions from symbols
@@ -251,6 +264,7 @@ impl AnalyzerState {
                 analyzed: false,
                 end: if symbol.size_known { Some(addr_ref + symbol.size as u32) } else { None },
                 slices: None,
+                tbtab: None,
             });
         }
         // Also check the beginning of every code section
@@ -455,14 +469,17 @@ impl AnalyzerState {
     }
 
     fn detect_new_functions(&mut self, obj: &ObjInfo) -> Result<bool> {
-        let mut new_functions = vec![];
+        let mut new_functions = Vec::new();
         for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
             let section_start = SectionAddress::new(section_index, section.address as u32);
             let section_end = section_start + section.size as u32;
-            let mut iter = self.functions.range(section_start..section_end).peekable();
+
+            let mut iter = self.functions
+                .range_mut(section_start..section_end)
+                .peekable();
             loop {
                 match (iter.next(), iter.peek()) {
-                    (Some((&first, first_info)), Some(&(&second, second_info))) => {
+                    (Some((&first, first_info)), Some((&second, second_info))) => {
                         let Some(first_end) = first_info.end else { continue };
                         if first_end > second {
                             bail!("Overlapping functions {}-{} -> {}", first, first_end, second);
@@ -474,15 +491,16 @@ impl AnalyzerState {
                         if second > addr {
                             // if (pef_flag)
                             let potential_tb_offset = first_end.address as usize - section.address as usize;
-                            let potential_tb = TracebackTable::read(&section.data, potential_tb_offset);
-                            if let Some(tb) = potential_tb {
-                                log::trace!("first {:#010X} second {:#010X}", first.address, second.address);
+                            let mut potential_tb = TracebackTable::read(&section.data, potential_tb_offset);
+                            if let Some(tb) = potential_tb.take() {
                                 let after_tb_off = first_end.address as usize + tb.size();
-                                if (after_tb_off == second.address as usize) {
+                                if after_tb_off == second.address as usize {
+                                    first_info.tbtab = Some(tb);
                                     continue;
                                 }
                                 else {
-                                    addr = SectionAddress{ section: section_index, address: after_tb_off as u32 };
+                                    addr.address = after_tb_off as u32;
+                                    potential_tb = Some(tb);
                                 }
                             }
                             log::trace!(
@@ -493,17 +511,24 @@ impl AnalyzerState {
                                 second.address,
                                 second_info.end,
                             );
-                            new_functions.push(addr);
+                            new_functions.push((addr, potential_tb));
                         }
                     }
                     (Some((last, last_info)), None) => {
                         let Some(last_end) = last_info.end else { continue };
                         if last_end < section_end {
-                            let addr = match skip_alignment(section, last_end, section_end) {
+                            let mut addr = match skip_alignment(section, last_end, section_end) {
                                 Some(addr) => addr,
                                 None => continue,
                             };
                             if addr < section_end {
+                                let potential_tb_offset = last_end.address as usize - section.address as usize;
+                                let mut potential_tb = TracebackTable::read(&section.data, potential_tb_offset);
+                                if let Some(tb) = potential_tb.take() {
+                                    let after_tb_off = last_end.address as usize + tb.size();
+                                    addr.address = after_tb_off as u32;
+                                    potential_tb = Some(tb);          
+                                }
                                 log::trace!(
                                     "Trying function @ {:#010X} (from {:#010X}-{:#010X} <-> {:#010X})",
                                     addr,
@@ -511,7 +536,7 @@ impl AnalyzerState {
                                     last_end,
                                     section_end,
                                 );
-                                new_functions.push(addr);
+                                new_functions.push((addr, potential_tb));
                             }
                         }
                     }
@@ -520,9 +545,19 @@ impl AnalyzerState {
             }
         }
         let found_new = !new_functions.is_empty();
-        for addr in new_functions {
-            let opt = self.functions.insert(addr, FunctionInfo::default());
-            ensure!(opt.is_none(), "Attempted to detect duplicate function @ {:#010X}", addr);
+        for (addr, tbtab) in new_functions {
+            if let Some(tbtab) = tbtab {
+                let fi = FunctionInfo {
+                    tbtab: Some(tbtab),      
+                    ..Default::default()
+                };
+                let opt = self.functions.insert(addr, fi);
+                ensure!(opt.is_none(), "Attempted to detect duplicate function @ {:#010X}", addr);
+            } 
+            else {
+                let opt = self.functions.insert(addr, FunctionInfo::default());
+                ensure!(opt.is_none(), "Attempted to detect duplicate function @ {:#010X}", addr);
+            }
         }
         Ok(found_new)
     }

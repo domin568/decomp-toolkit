@@ -87,6 +87,7 @@ impl AnalysisPass for FindSaveRestSleds {
                     analyzed: false,
                     end: Some(start + sled_size),
                     slices: None,
+                    tbtab: None,
                 });
                 state.known_symbols.entry(start).or_default().push(ObjSymbol {
                     name: func.to_string(),
