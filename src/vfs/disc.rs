@@ -13,7 +13,7 @@ use typed_path::Utf8UnixPath;
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::{
-    next_non_empty, StaticFile, Vfs, VfsError, VfsFile, VfsFileType, VfsMetadata, VfsResult,
+    StaticFile, Vfs, VfsError, VfsFile, VfsFileType, VfsMetadata, VfsResult, next_non_empty,
 };
 
 #[derive(Clone)]
@@ -47,7 +47,7 @@ impl DiscFs {
         Ok(Self { disc, base, meta, mtime })
     }
 
-    fn find(&self, path: &Utf8UnixPath) -> VfsResult<DiscNode> {
+    fn find(&self, path: &Utf8UnixPath) -> VfsResult<DiscNode<'_>> {
         let path = path.as_str().trim_matches('/');
         let mut split = path.split('/');
         let mut segment = next_non_empty(&mut split);
@@ -333,7 +333,7 @@ impl VfsFile for DiscFile {
 
 pub fn nod_to_io_error(e: nod::Error) -> io::Error {
     match e {
-        nod::Error::Io(msg, e) => io::Error::new(e.kind(), format!("{}: {}", msg, e)),
+        nod::Error::Io(msg, e) => io::Error::new(e.kind(), format!("{msg}: {e}")),
         e => io::Error::new(io::ErrorKind::InvalidData, e),
     }
 }

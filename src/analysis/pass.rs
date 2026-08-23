@@ -1,4 +1,4 @@
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use flagset::FlagSet;
 use itertools::Itertools;
 use memchr::memmem;
@@ -102,7 +102,7 @@ impl AnalysisPass for FindSaveRestSleds {
                 for i in reg_start..reg_end {
                     let addr = start + (i - reg_start) * step_size;
                     state.known_symbols.entry(addr).or_default().push(ObjSymbol {
-                        name: format!("{}{}", label, i),
+                        name: format!("{label}{i}"),
                         address: addr.address as u64,
                         section: Some(start.section),
                         size_known: true,

@@ -96,6 +96,7 @@ enum SubCommand {
     Dwarf(cmd::dwarf::Args),
     Elf(cmd::elf::Args),
     Elf2Dol(cmd::elf2dol::Args),
+    Extab(cmd::extab::Args),
     Map(cmd::map::Args),
     Nlzss(cmd::nlzss::Args),
     Pef(cmd::pef::Args),
@@ -126,7 +127,8 @@ fn main() {
         // Try to enable ANSI support on Windows.
         let _ = enable_ansi_support();
         // Disable isatty check for supports-color. (e.g. when used with ninja)
-        env::set_var("IGNORE_IS_TERMINAL", "1");
+        // SAFETY: Called early in main before any other threads are spawned.
+        unsafe { env::set_var("IGNORE_IS_TERMINAL", "1") };
         supports_color::on(Stream::Stdout).is_some_and(|c| c.has_basic)
     };
     // owo-colors uses an old version of supports-color, so we need to override manually.
@@ -173,6 +175,7 @@ fn main() {
         SubCommand::Dwarf(c_args) => cmd::dwarf::run(c_args),
         SubCommand::Elf(c_args) => cmd::elf::run(c_args),
         SubCommand::Elf2Dol(c_args) => cmd::elf2dol::run(c_args),
+        SubCommand::Extab(c_args) => cmd::extab::run(c_args),
         SubCommand::Map(c_args) => cmd::map::run(c_args),
         SubCommand::Nlzss(c_args) => cmd::nlzss::run(c_args),
         SubCommand::Pef(c_args) => cmd::pef::run(c_args),

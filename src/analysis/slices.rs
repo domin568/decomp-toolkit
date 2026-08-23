@@ -1,19 +1,19 @@
 use std::{
-    collections::{btree_map, BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map},
     ops::Range,
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use ppc750cl::{Ins, Opcode};
 
 use crate::{
     analysis::{
+        RelocationTarget,
         cfa::{FunctionInfo, SectionAddress},
         disassemble,
         executor::{ExecCbData, ExecCbResult, Executor},
         uniq_jump_table_entries,
-        vm::{section_address_for, BranchTarget, GprValue, StepResult, VM},
-        RelocationTarget,
+        vm::{BranchTarget, GprValue, StepResult, VM, section_address_for},
     },
     obj::{ObjInfo, ObjKind, ObjSection, ObjSymbolKind},
 };
@@ -45,6 +45,41 @@ type BlockRange = Range<SectionAddress>;
 
 type InsCheck = dyn Fn(Ins) -> bool;
 
+/// Stop searching for prologue/epilogue sequences if the next instruction
+/// is a branch or uses r0 or r1.
+fn is_end_of_seq(next: &Ins) -> bool {
+    next.is_branch()
+        || next
+            .defs()
+            .iter()
+            .chain(next.uses().iter())
+            .any(|a| matches!(a, ppc750cl::Argument::GPR(ppc750cl::GPR(0 | 1))))
+}
+
+fn is_function_terminator(ins: &Ins) -> bool {
+    // blr
+    if ins.is_blr() {
+        return true;
+    }
+    // b (not bl/bla)
+    if ins.op == Opcode::B && (ins.code & 1) == 0 {
+        return true;
+    }
+    // rfi
+    if ins.op == Opcode::Rfi {
+        return true;
+    }
+    // addi r1, r1, SIMM
+    if ins.op == Opcode::Addi && ins.field_rd() == 1 && ins.field_ra() == 1 {
+        return true;
+    }
+    // lwz r1, d(rN), N != r1
+    if ins.op == Opcode::Lwz && ins.field_rd() == 1 && ins.field_ra() != 1 {
+        return true;
+    }
+    false
+}
+
 #[inline(always)]
 fn check_sequence(
     section: &ObjSection,
@@ -52,29 +87,26 @@ fn check_sequence(
     ins: Option<Ins>,
     sequence: &[(&InsCheck, &InsCheck)],
 ) -> Result<bool> {
-    let mut found = false;
+    let ins = ins
+        .or_else(|| disassemble(section, addr.address))
+        .with_context(|| format!("Failed to disassemble instruction at {addr:#010X}"))?;
     for &(first, second) in sequence {
-        let Some(ins) = ins.or_else(|| disassemble(section, addr.address)) else {
-            continue;
-        };
         if !first(ins) {
             continue;
         }
-        let Some(next) = disassemble(section, addr.address + 4) else {
-            continue;
-        };
-        if second(next)
-            // Also check the following instruction, in case the scheduler
-            // put something in between.
-            || (!next.is_branch()
-                && matches!(disassemble(section, addr.address + 8), Some(ins) if second(ins)))
-        {
-            found = true;
-            break;
+        let mut current_addr = addr.address + 4;
+        while let Some(next) = disassemble(section, current_addr) {
+            if second(next) {
+                return Ok(true);
+            }
+            if is_end_of_seq(&next) {
+                // If we hit a branch or an instruction that uses r0 or r1, stop searching.
+                break;
+            }
+            current_addr += 4;
         }
     }
-
-    Ok(found)
+    Ok(false)
 }
 
 fn check_prologue_sequence(
@@ -89,15 +121,19 @@ fn check_prologue_sequence(
     }
     #[inline(always)]
     fn is_stwu(ins: Ins) -> bool {
-        // stwu r1, d(r1)
-        ins.op == Opcode::Stwu && ins.field_rs() == 1 && ins.field_ra() == 1
+        // stwu[x] r1, d(r1)
+        matches!(ins.op, Opcode::Stwu | Opcode::Stwux) && ins.field_rs() == 1 && ins.field_ra() == 1
     }
     #[inline(always)]
     fn is_stw(ins: Ins) -> bool {
         // stw r0, d(r1)
         ins.op == Opcode::Stw && ins.field_rs() == 0 && ins.field_ra() == 1
     }
-    check_sequence(section, addr, ins, &[(&is_stwu, &is_mflr), (&is_mflr, &is_stw)])
+    check_sequence(section, addr, ins, &[
+        (&is_stwu, &is_mflr),
+        (&is_mflr, &is_stw),
+        (&is_mflr, &is_stwu),
+    ])
 }
 
 impl FunctionSlices {
@@ -148,8 +184,32 @@ impl FunctionSlices {
         }
         if check_prologue_sequence(section, addr, Some(ins))? {
             if let Some(prologue) = self.prologue {
-                if prologue != addr && prologue != addr - 4 {
-                    bail!("Found multiple functions inside a symbol: {:#010X} and {:#010X}. Check symbols.txt?", prologue, addr)
+                let invalid_seq = if prologue == addr {
+                    false
+                } else if prologue > addr {
+                    true
+                } else {
+                    // Check if any instruction between the two prologues is a function terminator.
+                    let mut current_addr = prologue.address + 4;
+                    loop {
+                        if current_addr == addr.address {
+                            break false;
+                        }
+                        let next = disassemble(section, current_addr).with_context(|| {
+                            format!("Failed to disassemble {current_addr:#010X}")
+                        })?;
+                        if is_function_terminator(&next) {
+                            break true;
+                        }
+                        current_addr += 4;
+                    }
+                };
+                if invalid_seq {
+                    bail!(
+                        "Found multiple functions inside a symbol: {:#010X} and {:#010X}. Check symbols.txt?",
+                        prologue,
+                        addr
+                    )
                 }
             } else {
                 self.prologue = Some(addr);
@@ -180,7 +240,11 @@ impl FunctionSlices {
             ins.op == Opcode::Or && ins.field_rd() == 1
         }
 
-        if check_sequence(section, addr, Some(ins), &[(&is_mtlr, &is_addi), (&is_or, &is_mtlr)])? {
+        if check_sequence(section, addr, Some(ins), &[
+            (&is_mtlr, &is_addi),
+            (&is_mtlr, &is_or),
+            (&is_or, &is_mtlr),
+        ])? {
             if let Some(epilogue) = self.epilogue {
                 if epilogue != addr {
                     bail!("Found duplicate epilogue: {:#010X} and {:#010X}", epilogue, addr)
@@ -227,7 +291,7 @@ impl FunctionSlices {
             })?;
         }
         self.check_epilogue(section, ins_addr, ins)
-            .with_context(|| format!("While processing {:#010X}: {:#?}", function_start, self))?;
+            .with_context(|| format!("While processing {function_start:#010X}: {self:#?}"))?;
         if !self.has_conditional_blr && is_conditional_blr(ins) {
             self.has_conditional_blr = true;
         }
@@ -340,7 +404,14 @@ impl FunctionSlices {
                         function_end.or_else(|| self.end()),
                     )?;
                     log::debug!("-> size {}: {:?}", size, entries);
-                    if (entries.contains(&next_address) || self.blocks.contains_key(&next_address))
+                    let max_block = self
+                        .blocks
+                        .keys()
+                        .next_back()
+                        .copied()
+                        .unwrap_or(next_address)
+                        .max(next_address);
+                    if entries.iter().any(|&addr| addr > function_start && addr <= max_block)
                         && !entries.iter().any(|&addr| {
                             self.is_known_function(known_functions, addr)
                                 .is_some_and(|fn_addr| fn_addr != function_start)
@@ -703,7 +774,7 @@ impl FunctionSlices {
                 }
             }
             // If we discovered a function prologue, known tail call.
-            if slices.prologue.is_some() {
+            if slices.prologue.is_some() || slices.has_r1_load {
                 log::trace!("Prologue discovered; known tail call: {:#010X}", addr);
                 return TailCallResult::Is;
             }

@@ -1,24 +1,24 @@
 use std::{
-    collections::{btree_map, BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, btree_map},
     fs,
     fs::DirBuilder,
     io::{Cursor, Write},
 };
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use argp::FromArgs;
-use objdiff_core::obj::split_meta::{SplitMeta, SPLITMETA_SECTION};
+use objdiff_core::obj::split_meta::{SPLITMETA_SECTION, SplitMeta};
 use object::{
-    elf,
-    write::{Mangling, SectionId, SymbolId},
     FileFlags, Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionFlags, SectionIndex,
-    SectionKind, SymbolFlags, SymbolIndex, SymbolKind, SymbolScope, SymbolSection,
+    SectionKind, SymbolFlags, SymbolIndex, SymbolKind, SymbolScope, SymbolSection, elf,
+    write::{Mangling, SectionId, SymbolId},
 };
 use typed_path::Utf8NativePathBuf;
 
 use crate::{
     obj::ObjKind,
     util::{
+        IntoCow, ToCow,
         asm::write_asm,
         comment::{CommentSym, MWComment},
         config::{write_splits_file, write_symbols_file},
@@ -26,9 +26,8 @@ use crate::{
         file::{buf_writer, process_rsp},
         path::native_path,
         reader::{Endian, FromReader},
-        signatures::{compare_signature, generate_signature, FunctionSignature},
+        signatures::{FunctionSignature, compare_signature, generate_signature},
         split::split_obj,
-        IntoCow, ToCow,
     },
 };
 
@@ -136,7 +135,7 @@ fn disasm(args: DisasmArgs) -> Result<()> {
     match obj.kind {
         ObjKind::Executable => {
             log::info!("Splitting {} objects", obj.link_order.len());
-            let split_objs = split_obj(&obj, None)?;
+            let split_objs = split_obj(&obj, None, false)?;
 
             let asm_dir = args.out.join("asm");
             let include_dir = args.out.join("include");
@@ -146,14 +145,14 @@ fn disasm(args: DisasmArgs) -> Result<()> {
             let mut files_out = buf_writer(&args.out.join("link_order.txt"))?;
             for (unit, split_obj) in obj.link_order.iter().zip(&split_objs) {
                 let out_name = file_stem_from_unit(&unit.name);
-                let out_path = asm_dir.join(format!("{}.s", out_name));
+                let out_path = asm_dir.join(format!("{out_name}.s"));
                 log::info!("Writing {}", out_path);
 
                 let mut w = buf_writer(&out_path)?;
                 write_asm(&mut w, split_obj)?;
                 w.flush()?;
 
-                writeln!(files_out, "{}.o", out_name)?;
+                writeln!(files_out, "{out_name}.o")?;
             }
             files_out.flush()?;
         }
@@ -402,7 +401,7 @@ fn signatures(args: SignaturesArgs) -> Result<()> {
             Ok(Some(signature)) => signature,
             Ok(None) => continue,
             Err(e) => {
-                eprintln!("Failed: {:?}", e);
+                eprintln!("Failed: {e:?}");
                 continue;
             }
         };
@@ -545,13 +544,13 @@ fn info(args: InfoArgs) -> Result<()> {
                     .context("While reading .note.split section")?;
             println!("\nSplit metadata (.note.split):");
             if let Some(generator) = &meta.generator {
-                println!("\tGenerator: {}", generator);
+                println!("\tGenerator: {generator}");
             }
             if let Some(module_name) = &meta.module_name {
-                println!("\tModule name: {}", module_name);
+                println!("\tModule name: {module_name}");
             }
             if let Some(module_id) = meta.module_id {
-                println!("\tModule ID: {}", module_id);
+                println!("\tModule ID: {module_id}");
             }
             if let Some(virtual_addresses) = &meta.virtual_addresses {
                 println!("\tVirtual addresses:");

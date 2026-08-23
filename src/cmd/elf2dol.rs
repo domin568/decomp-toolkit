@@ -1,21 +1,25 @@
 use std::io::{Seek, SeekFrom, Write};
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{Result, anyhow, bail, ensure};
 use argp::FromArgs;
 use object::{Architecture, Endianness, Object, ObjectKind, ObjectSection, SectionKind};
 use typed_path::Utf8NativePathBuf;
 
 use crate::{
-    util::{file::buf_writer, path::native_path},
+    util::{
+        dol::{process_dol, write_dol},
+        file::buf_writer,
+        path::native_path,
+    },
     vfs::open_file,
 };
 
 #[derive(FromArgs, PartialEq, Eq, Debug)]
-/// Converts an ELF file to a DOL file.
+/// Converts an ELF, ALF, or BootStage file to a DOL file.
 #[argp(subcommand, name = "elf2dol")]
 pub struct Args {
     #[argp(positional, from_str_fn(native_path))]
-    /// path to input ELF
+    /// path to input ELF, ALF or BootStage file
     elf_file: Utf8NativePathBuf,
     #[argp(positional, from_str_fn(native_path))]
     /// path to output DOL
@@ -48,7 +52,12 @@ const MAX_DATA_SECTIONS: usize = 11;
 
 pub fn run(args: Args) -> Result<()> {
     let mut file = open_file(&args.elf_file, true)?;
-    let obj_file = object::read::File::parse(file.map()?)?;
+    let data = file.map()?;
+    if data.len() >= 4 && data[0..4] != object::elf::ELFMAG {
+        return convert_dol_like(args, data);
+    }
+
+    let obj_file = object::read::File::parse(data)?;
     match obj_file.architecture() {
         Architecture::PowerPc => {}
         arch => bail!("Unexpected architecture: {arch:?}"),
@@ -150,6 +159,14 @@ pub fn run(args: Args) -> Result<()> {
 
     // Done!
     out.flush()?;
+    Ok(())
+}
+
+/// Converts a DOL-like format (ALF or BootStage) to a DOL file.
+fn convert_dol_like(args: Args, data: &[u8]) -> Result<()> {
+    let obj = process_dol(data, "")?;
+    let mut out = buf_writer(&args.dol_file)?;
+    write_dol(&obj, &mut out)?;
     Ok(())
 }
 

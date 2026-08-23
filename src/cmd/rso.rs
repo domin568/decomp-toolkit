@@ -1,11 +1,11 @@
 use std::io::{BufRead, Seek, Write};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use argp::FromArgs;
 use object::{
-    elf::{R_PPC_NONE, R_PPC_REL24},
     Architecture, Endianness, Object, ObjectKind, ObjectSection, ObjectSymbol, SectionKind,
     SymbolIndex, SymbolKind, SymbolSection,
+    elf::{R_PPC_NONE, R_PPC_REL24},
 };
 use typed_path::{Utf8NativePath, Utf8NativePathBuf};
 
@@ -15,8 +15,8 @@ use crate::{
         path::native_path,
         reader::{Endian, ToWriter},
         rso::{
-            process_rso, symbol_hash, RsoHeader, RsoRelocation, RsoSectionHeader, RsoSymbol,
-            RSO_SECTION_NAMES,
+            RSO_SECTION_NAMES, RsoHeader, RsoRelocation, RsoSectionHeader, RsoSymbol, process_rso,
+            symbol_hash,
         },
     },
     vfs::open_file,
@@ -143,7 +143,7 @@ fn make_rso(
 
             let si = sym
                 .section_index()
-                .with_context(|| format!("Failed to find symbol `{}` section index", name))?;
+                .with_context(|| format!("Failed to find symbol `{name}` section index"))?;
             let addr = sym.address();
 
             *index = si.0 as u8;
@@ -204,8 +204,7 @@ fn make_rso(
     let mut rso_sections: Vec<RsoSectionHeader> =
         vec![RsoSectionHeader::default() /* ELF null section */];
     for section in file.sections() {
-        let is_valid_section =
-            section.name().is_ok_and(|n| RSO_SECTION_NAMES.iter().any(|&s| s == n));
+        let is_valid_section = section.name().is_ok_and(|n| RSO_SECTION_NAMES.contains(&n));
         let section_size = section.size();
 
         if !is_valid_section || section_size == 0 {
@@ -321,8 +320,7 @@ fn make_rso(
     let mut exported_relocations: Vec<RsoRelocation> = vec![];
 
     for section in file.sections() {
-        let is_valid_section =
-            section.name().is_ok_and(|n| RSO_SECTION_NAMES.iter().any(|&s| s == n));
+        let is_valid_section = section.name().is_ok_and(|n| RSO_SECTION_NAMES.contains(&n));
         if !is_valid_section {
             continue;
         }
@@ -430,7 +428,7 @@ fn make_rso(
     });
 
     // Sort Export Symbol by Hash
-    export_symbol_table.sort_by(|lhs, rhs| rhs.hash.unwrap().cmp(&lhs.hash.unwrap()));
+    export_symbol_table.sort_by_key(|e| std::cmp::Reverse(e.hash.unwrap()));
 
     {
         // Write Export Symbol Table

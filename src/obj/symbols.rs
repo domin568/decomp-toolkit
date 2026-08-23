@@ -4,15 +4,15 @@ use std::{
     ops::{Index, RangeBounds},
 };
 
-use anyhow::{anyhow, bail, ensure, Result};
-use flagset::{flags, FlagSet};
+use anyhow::{Result, anyhow, bail, ensure};
+use flagset::{FlagSet, flags};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::{
     analysis::cfa::SectionAddress,
-    obj::{sections::SectionIndex, ObjKind, ObjRelocKind, ObjSections},
+    obj::{ObjKind, ObjRelocKind, ObjSections, sections::SectionIndex},
     util::{
         config::{is_auto_jump_table, is_auto_label, is_auto_symbol, parse_u32},
         nested::NestedVec,
@@ -175,8 +175,10 @@ pub enum ObjDataKind {
     Float,
     Double,
     String,
+    ShiftJIS,
     String16,
     StringTable,
+    ShiftJISTable,
     String16Table,
     Int,
     Short,
@@ -270,11 +272,7 @@ impl ObjSymbols {
                         existing.size,
                         in_symbol.size
                     );
-                    if replace {
-                        in_symbol.size
-                    } else {
-                        existing.size
-                    }
+                    if replace { in_symbol.size } else { existing.size }
                 } else if in_symbol.size_known {
                     in_symbol.size
                 } else {
@@ -401,7 +399,7 @@ impl ObjSymbols {
     pub fn iter_ordered(&self) -> impl DoubleEndedIterator<Item = (SymbolIndex, &ObjSymbol)> {
         self.symbols_by_section
             .iter()
-            .flat_map(|v| v.iter().map(|(_, v)| v))
+            .flat_map(|v| v.values())
             .flat_map(move |v| v.iter().map(move |u| (*u, &self.symbols[*u as usize])))
     }
 
@@ -448,7 +446,7 @@ impl ObjSymbols {
         self.symbols_by_section
             .get(section_idx as usize)
             .into_iter()
-            .flat_map(|v| v.iter().map(|(_, v)| v))
+            .flat_map(|v| v.values())
             .flat_map(move |v| v.iter().map(move |u| (*u, &self.symbols[*u as usize])))
     }
 

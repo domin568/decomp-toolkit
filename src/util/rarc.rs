@@ -1,7 +1,7 @@
 use std::{borrow::Cow, ffi::CStr};
 
 use typed_path::Utf8UnixPath;
-use zerocopy::{big_endian::*, FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, big_endian::*};
 
 use crate::{static_assert, vfs::next_non_empty};
 
@@ -200,7 +200,7 @@ impl<'a> RarcView<'a> {
     }
 
     /// Get a string from the string table at the given offset.
-    pub fn get_string(&self, offset: u32) -> Result<Cow<str>, String> {
+    pub fn get_string(&self, offset: u32) -> Result<Cow<'_, str>, String> {
         let name_buf = self.string_table.get(offset as usize..).ok_or_else(|| {
             format!(
                 "RARC: name offset {} out of bounds (string table size: {})",
@@ -209,7 +209,7 @@ impl<'a> RarcView<'a> {
             )
         })?;
         let c_string = CStr::from_bytes_until_nul(name_buf)
-            .map_err(|_| format!("RARC: name at offset {} not null-terminated", offset))?;
+            .map_err(|_| format!("RARC: name at offset {offset} not null-terminated"))?;
         Ok(c_string.to_string_lossy())
     }
 

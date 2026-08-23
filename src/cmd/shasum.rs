@@ -1,9 +1,9 @@
 use std::{
     fs::File,
-    io::{stdout, BufRead, Read, Write},
+    io::{BufRead, Read, Write, stdout},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use argp::FromArgs;
 use owo_colors::{OwoColorize, Stream};
 use sha1::{Digest, Sha1};
@@ -45,14 +45,13 @@ pub fn run(args: Args) -> Result<()> {
             check(&args, file.as_mut())?;
         }
         if let Some(out_path) = &args.output {
-            touch(out_path)
-                .with_context(|| format!("Failed to touch output file '{}'", out_path))?;
+            touch(out_path).with_context(|| format!("Failed to touch output file '{out_path}'"))?;
         }
     } else {
         let mut w: Box<dyn Write> = if let Some(out_path) = &args.output {
             Box::new(
                 buf_writer(out_path)
-                    .with_context(|| format!("Failed to open output file '{}'", out_path))?,
+                    .with_context(|| format!("Failed to open output file '{out_path}'"))?,
             )
         } else {
             Box::new(stdout())

@@ -4,9 +4,9 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
 };
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use itertools::Itertools;
-use object::{elf, Object, ObjectSection, ObjectSymbol};
+use object::{Object, ObjectSection, ObjectSymbol, elf};
 use tracing::warn;
 
 use crate::{
@@ -16,10 +16,9 @@ use crate::{
         ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, SectionIndex,
     },
     util::{
-        align_up,
-        reader::{struct_size, Endian, FromReader, ToWriter, DYNAMIC_SIZE},
+        IntoCow, align_up,
+        reader::{DYNAMIC_SIZE, Endian, FromReader, ToWriter, struct_size},
         split::default_section_align,
-        IntoCow,
     },
 };
 
@@ -364,7 +363,7 @@ where
     reader.seek(SeekFrom::Start(header.section_info_offset as u64))?;
     for idx in 0..header.num_sections {
         let section = RelSectionHeader::from_reader(reader, Endian::Big)
-            .with_context(|| format!("Failed to read REL section header {}", idx))?;
+            .with_context(|| format!("Failed to read REL section header {idx}"))?;
         sections.push(section);
     }
     Ok(sections)
@@ -390,7 +389,7 @@ where R: Read + Seek + ?Sized {
             reader.seek(SeekFrom::Start(offset as u64))?;
             let mut data = vec![0u8; size as usize];
             reader.read_exact(&mut data).with_context(|| {
-                format!("Failed to read REL section {} data with size {:#X}", idx, size)
+                format!("Failed to read REL section {idx} data with size {size:#X}")
             })?;
             reader.seek(SeekFrom::Start(position))?;
             data
@@ -405,7 +404,7 @@ where R: Read + Seek + ?Sized {
             text_section = Some(idx as u8);
             (".text".to_string(), ObjSectionKind::Code, true)
         } else {
-            (format!(".section{}", idx), ObjSectionKind::Data, false)
+            (format!(".section{idx}"), ObjSectionKind::Data, false)
         };
         sections.push(ObjSection {
             name,
@@ -719,11 +718,7 @@ where
         // so that the space can be reclaimed via OSLinkFixed. (See fix_size)
         relocations.sort_by(|a, b| {
             if a.module_id == 0 {
-                if b.module_id == 0 {
-                    Ordering::Equal
-                } else {
-                    Ordering::Greater
-                }
+                if b.module_id == 0 { Ordering::Equal } else { Ordering::Greater }
             } else if a.module_id == info.module_id {
                 if b.module_id == 0 {
                     Ordering::Less

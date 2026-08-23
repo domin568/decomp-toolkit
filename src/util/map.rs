@@ -7,8 +7,8 @@ use std::{
     mem::{replace, take},
 };
 
-use anyhow::{anyhow, bail, Error, Result};
-use cwdemangle::{demangle, DemangleOptions};
+use anyhow::{Error, Result, anyhow, bail};
+use cwdemangle::{DemangleOptions, demangle};
 use flagset::FlagSet;
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -19,9 +19,9 @@ use typed_path::Utf8NativePath;
 
 use crate::{
     obj::{
-        section_kind_for_section, ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind,
-        ObjSections, ObjSplit, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
-        ObjSymbols, ObjUnit, SectionIndex,
+        ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind, ObjSections, ObjSplit,
+        ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbols, ObjUnit,
+        SectionIndex, section_kind_for_section,
     },
     util::nested::NestedVec,
     vfs::open_file,
@@ -107,7 +107,10 @@ static_regex!(
 // Memory map
 static_regex!(MEMORY_MAP_START, "^\\s*Memory map:\\s*$");
 static_regex!(MEMORY_MAP_HEADER, "^(\\s*Starting Size\\s+File\\s*|\\s*address\\s+Offset\\s*)$");
-static_regex!(MEMORY_MAP_ENTRY, "^\\s*(?P<section>\\S+)\\s+(?P<addr>[0-9A-Fa-f]+|\\.{0,8})\\s+(?P<size>[0-9A-Fa-f]+|\\.{1,8})\\s+(?P<offset>[0-9A-Fa-f]+|\\.{1,8})\\s*$");
+static_regex!(
+    MEMORY_MAP_ENTRY,
+    "^\\s*(?P<section>\\S+)\\s+(?P<addr>[0-9A-Fa-f]+|\\.{0,8})\\s+(?P<size>[0-9A-Fa-f]+|\\.{1,8})\\s+(?P<offset>[0-9A-Fa-f]+|\\.{1,8})\\s*$"
+);
 
 // Linker generated symbols
 static_regex!(LINKER_SYMBOLS_START, "^\\s*Linker generated symbols:\\s*$");
@@ -201,7 +204,7 @@ impl StateMachine {
                     bail!("Unexpected line while processing map: '{line}'");
                 }
             }
-            ProcessMapState::LinkMap(ref mut state) => {
+            ProcessMapState::LinkMap(state) => {
                 if let Some(captures) = LINK_MAP_ENTRY.captures(&line) {
                     StateMachine::process_link_map_entry(captures, state, &mut self.result)?;
                 } else if let Some(captures) = LINK_MAP_ENTRY_GENERATED.captures(&line) {
@@ -224,7 +227,7 @@ impl StateMachine {
                     bail!("Unexpected line while processing map: '{line}'");
                 }
             }
-            ProcessMapState::SectionLayout(ref mut state) => {
+            ProcessMapState::SectionLayout(state) => {
                 if let Some(captures) = SECTION_LAYOUT_SYMBOL.captures(&line) {
                     StateMachine::section_layout_entry(captures, state, &self.result)?;
                 } else if let Some(captures) = SECTION_LAYOUT_START.captures(&line) {
@@ -461,7 +464,7 @@ impl StateMachine {
             let mut last_unit = None;
             let mut add_to_next = vec![];
             while let Some((_, symbols)) = symbols_iter.next() {
-                let next_addr = if let Some((&next_addr, _)) = symbols_iter.peek() {
+                let next_addr = if let Some(&(&next_addr, _)) = symbols_iter.peek() {
                     next_addr
                 } else {
                     u32::MAX

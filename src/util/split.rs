@@ -1,20 +1,20 @@
 use std::{
-    cmp::{max, min, Ordering},
-    collections::{btree_map, BTreeMap, HashMap, HashSet},
+    cmp::{Ordering, max, min},
+    collections::{BTreeMap, HashMap, HashSet, btree_map},
 };
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use itertools::Itertools;
 use objdiff_core::obj::split_meta::SplitMeta;
 use sanitise_file_name::sanitize_with_options;
 use tracing_attributes::instrument;
 
 use crate::{
-    analysis::{cfa::SectionAddress, read_address, read_u32},
+    analysis::{cfa::SectionAddress, read_address, read_u32, relocation_target_for},
     obj::{
-        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocations, ObjSection, ObjSectionKind,
-        ObjSplit, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope,
-        ObjUnit, SectionIndex, SymbolIndex,
+        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjRelocations, ObjSection,
+        ObjSectionKind, ObjSplit, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
+        ObjSymbolScope, ObjUnit, SectionIndex, SymbolIndex,
     },
     util::{align_up, comment::MWComment, toposort::toposort},
 };
@@ -26,7 +26,27 @@ fn split_ctors_dtors(obj: &mut ObjInfo, start: SectionAddress, end: SectionAddre
     let mut current_address = start;
     let mut referenced_symbols = vec![];
 
+    // ProDG ctor list can start with -1
+    if matches!(read_u32(ctors_section, current_address.address), Some(0xFFFFFFFF)) {
+        current_address += 4;
+    }
+
     while current_address < end {
+        // ProDG hack when the end address is not known
+        if matches!(read_u32(ctors_section, current_address.address), Some(0))
+            && relocation_target_for(obj, current_address, Some(ObjRelocKind::Absolute))?.is_none()
+        {
+            while current_address < end {
+                ensure!(
+                    matches!(read_u32(ctors_section, current_address.address), Some(0)),
+                    "{} data detected at {:#010X} after null pointer",
+                    ctors_section.name,
+                    current_address,
+                );
+                current_address += 4;
+            }
+            break;
+        }
         let function_addr = read_address(obj, ctors_section, current_address.address)?;
         log::debug!("Found {} entry: {:#010X}", ctors_section.name, function_addr);
 
@@ -116,7 +136,22 @@ fn split_ctors_dtors(obj: &mut ObjInfo, start: SectionAddress, end: SectionAddre
     Ok(())
 }
 
+/// Collected extabindex entry data for grouping.
+struct ExtabIndexEntry {
+    eti_address: SectionAddress,
+    function_addr: SectionAddress,
+    function_size: u32,
+    extab_addr: SectionAddress,
+}
+
 /// Create splits for extabindex + extab entries.
+///
+/// With `-inline deferred`, functions within a TU may be emitted in reverse order
+/// in `.text`, while extab data remains in source (forward) order. This means
+/// consecutive extabindex entries can reference decreasing extab addresses.
+/// To avoid contradictory ordering constraints (which cause cyclic dependency errors
+/// in link order resolution), we group such reversed entries and assign them a single
+/// TU name, creating one covering split per section type.
 fn split_extabindex(obj: &mut ObjInfo, start: SectionAddress) -> Result<()> {
     let section = &obj.sections[start.section];
     let mut new_splits = BTreeMap::<SectionAddress, ObjSplit>::new();
@@ -134,8 +169,10 @@ fn split_extabindex(obj: &mut ObjInfo, start: SectionAddress) -> Result<()> {
     let (extab_section_index, extab_section) =
         obj.sections.by_name("extab")?.ok_or_else(|| anyhow!("Failed to find extab section"))?;
 
-    let mut current_address = start;
+    // Phase A: Collect all entries upfront.
     let section_end = eti_init_info.address as u32;
+    let mut entries = Vec::new();
+    let mut current_address = start;
     while current_address.address < section_end {
         let function_addr = read_address(obj, section, current_address.address)?;
         let function_size = read_u32(section, current_address.address + 4).with_context(|| {
@@ -157,144 +194,437 @@ fn split_extabindex(obj: &mut ObjInfo, start: SectionAddress) -> Result<()> {
             function_size,
             extab_addr
         );
+        entries.push(ExtabIndexEntry {
+            eti_address: current_address,
+            function_addr,
+            function_size,
+            extab_addr,
+        });
+        current_address += 12;
+    }
 
-        let Some((_, eti_symbol)) = obj.symbols.kind_at_section_address(
-            current_address.section,
-            current_address.address,
-            ObjSymbolKind::Object,
-        )?
-        else {
-            bail!("Failed to find extabindex symbol @ {:#010X}", current_address);
-        };
-        ensure!(
-            eti_symbol.size_known && eti_symbol.size == 12,
-            "extabindex symbol {} has mismatched size ({:#X}, expected {:#X})",
-            eti_symbol.name,
-            eti_symbol.size,
-            12
-        );
-
-        let text_section = &obj.sections[function_addr.section];
-        let Some((_, function_symbol)) = obj.symbols.kind_at_section_address(
-            function_addr.section,
-            function_addr.address,
-            ObjSymbolKind::Function,
-        )?
-        else {
-            bail!("Failed to find function symbol @ {:#010X}", function_addr);
-        };
-        ensure!(
-            function_symbol.size_known && function_symbol.size == function_size as u64,
-            "Function symbol {} has mismatched size ({:#X}, expected {:#X})",
-            function_symbol.name,
-            function_symbol.size,
-            function_size
-        );
-
-        let Some((_, extab_symbol)) = obj.symbols.kind_at_section_address(
-            extab_addr.section,
-            extab_addr.address,
-            ObjSymbolKind::Object,
-        )?
-        else {
-            bail!("Failed to find extab symbol @ {:#010X}", extab_addr);
-        };
-        ensure!(
-            extab_symbol.size_known && extab_symbol.size > 0,
-            "extab symbol {} has unknown size",
-            extab_symbol.name
-        );
-
-        let extabindex_split = section.splits.for_address(current_address.address);
-        let extab_split = extab_section.splits.for_address(extab_addr.address);
-        let function_split = text_section.splits.for_address(function_addr.address);
-
-        let mut expected_unit = None;
-        if let Some((_, extabindex_split)) = extabindex_split {
-            expected_unit = Some(extabindex_split.unit.clone());
+    // Phase B: Group entries that belong to the same TU.
+    //
+    // With `-inline deferred` (or weak functions), functions within a TU may be emitted
+    // in a different order in `.text` than their extab data in the `extab` section.
+    // Since a TU always occupies one contiguous range per section, we detect this by
+    // looking for decreases in extab addresses (which indicate reversed function ordering),
+    // then absorbing earlier entries whose extab falls within the same contiguous range.
+    //
+    // Pass 1 (forward): Use a running-maximum to detect reversed entries. When an entry's
+    // extab_addr is below the running max, it joins the current group.
+    //
+    // Pass 2 (backward absorption): For each multi-entry group, walk backwards and absorb
+    // preceding entries whose extab_addr falls within the group's extab range. These entries
+    // are part of the same TU but appeared "normal" because they were iterated before the
+    // reversal was detected.
+    let mut group_ids: Vec<usize> = Vec::new(); // group ID per entry
+    let mut num_groups = 0usize;
+    if !entries.is_empty() {
+        // Pass 1: forward scan with running maximum
+        group_ids.resize(entries.len(), 0);
+        let mut max_extab = entries[0].extab_addr.address;
+        let mut current_group = 0;
+        group_ids[0] = current_group;
+        for i in 1..entries.len() {
+            if entries[i].extab_addr.address >= max_extab {
+                // New group
+                current_group += 1;
+                max_extab = entries[i].extab_addr.address;
+            }
+            // If < max_extab, entry joins current group (reversed).
+            // Don't update max_extab for reversed entries.
+            group_ids[i] = current_group;
         }
-        if let Some((_, extab_split)) = extab_split {
-            if let Some(unit) = &expected_unit {
-                ensure!(
-                    unit == &extab_split.unit,
-                    "Mismatched splits for extabindex {:#010X} ({}) and extab {:#010X} ({})",
-                    current_address,
-                    unit,
-                    extab_addr,
-                    extab_split.unit
+        num_groups = current_group + 1;
+
+        // Pass 2: backward absorption
+        // For each multi-entry group, find its extab range and absorb earlier entries
+        // whose extab falls within that range.
+        let mut group_sizes: Vec<usize> = vec![0; num_groups];
+        for &g in &group_ids {
+            group_sizes[g] += 1;
+        }
+
+        for (g, group_size) in group_sizes.into_iter().enumerate() {
+            if group_size <= 1 {
+                continue; // Only process multi-entry (reversed) groups
+            }
+
+            // Compute this group's extab range
+            let min_extab = entries
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| group_ids[i] == g)
+                .map(|(_, e)| e.extab_addr.address)
+                .min()
+                .unwrap();
+            let max_extab = entries
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| group_ids[i] == g)
+                .map(|(_, e)| e.extab_addr.address)
+                .max()
+                .unwrap();
+
+            // Find the first entry in this group
+            let first_in_group = group_ids.iter().position(|&gid| gid == g).unwrap();
+
+            // Walk backwards from the first entry, absorbing earlier entries
+            // whose extab falls within [min_extab, max_extab]
+            let mut absorbed = 0;
+            for i in (0..first_in_group).rev() {
+                if entries[i].extab_addr.address >= min_extab
+                    && entries[i].extab_addr.address <= max_extab
+                {
+                    group_ids[i] = g;
+                    absorbed += 1;
+                }
+            }
+            if absorbed > 0 {
+                log::debug!(
+                    "Absorbed {} earlier entries into reversed group {} (extab range {:#010X}-{:#010X})",
+                    absorbed,
+                    g,
+                    min_extab,
+                    max_extab,
                 );
-            } else {
-                expected_unit = Some(extab_split.unit.clone());
             }
         }
-        if let Some((_, function_split)) = function_split {
-            if let Some(unit) = &expected_unit {
-                ensure!(
-                    unit == &function_split.unit,
-                    "Mismatched splits for extabindex {:#010X} ({}) and function {:#010X} ({})",
-                    current_address,
-                    unit,
-                    function_addr,
-                    function_split.unit
-                );
-            } else {
-                expected_unit = Some(function_split.unit.clone());
+    }
+
+    // Pass 3: Merge groups with overlapping extabindex ranges.
+    // After absorption, two groups may have interleaved extabindex entries,
+    // producing overlapping covering splits. Merge such groups.
+    if num_groups > 1 {
+        // Compute extabindex range [eti_min, eti_max] for each group.
+        let mut group_eti_ranges: Vec<Option<(u32, u32)>> = vec![None; num_groups];
+        for (i, &g) in group_ids.iter().enumerate() {
+            let addr = entries[i].eti_address.address;
+            match &mut group_eti_ranges[g] {
+                Some((min, max)) => {
+                    *min = (*min).min(addr);
+                    *max = (*max).max(addr);
+                }
+                None => {
+                    group_eti_ranges[g] = Some((addr, addr));
+                }
             }
         }
 
-        if extabindex_split.is_none() || extab_split.is_none() || function_split.is_none() {
+        // Sort groups by eti_min and merge overlapping ones.
+        // Build a list of (eti_min, eti_end, group_id) for non-empty groups.
+        let mut sorted_groups: Vec<(u32, u32, usize)> = group_eti_ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(g, range)| range.map(|(min, max)| (min, max + 12, g)))
+            .collect();
+        sorted_groups.sort_by_key(|&(min, _, _)| min);
+
+        let mut merged = true;
+        while merged {
+            merged = false;
+            for i in 0..sorted_groups.len().saturating_sub(1) {
+                let (_, end_a, ga) = sorted_groups[i];
+                let (start_b, end_b, gb) = sorted_groups[i + 1];
+                if start_b < end_a && ga != gb {
+                    // Overlapping ranges: merge gb into ga.
+                    let merge_into = ga.min(gb);
+                    let merge_from = ga.max(gb);
+                    for gid in group_ids.iter_mut() {
+                        if *gid == merge_from {
+                            *gid = merge_into;
+                        }
+                    }
+                    // Update the range for the merged group.
+                    sorted_groups[i].1 = end_a.max(end_b);
+                    sorted_groups[i].2 = merge_into;
+                    sorted_groups.remove(i + 1);
+                    merged = true;
+                    log::debug!(
+                        "Merged overlapping groups {} and {} (extabindex range {:#010X}-{:#010X})",
+                        merge_from,
+                        merge_into,
+                        sorted_groups[i].0,
+                        sorted_groups[i].1,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    // Build group ranges: collect entry indices per group, in iteration order.
+    let mut group_entries: Vec<Vec<usize>> = vec![Vec::new(); num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        group_entries[g].push(i);
+    }
+
+    // Phase C: Process each group.
+    for indices in group_entries {
+        if indices.is_empty() {
+            continue;
+        }
+
+        let is_reversed = indices.len() > 1;
+        if is_reversed {
+            log::debug!(
+                "Found reversed extab group with {} entries (extab range {:#010X}-{:#010X})",
+                indices.len(),
+                indices.iter().map(|&i| entries[i].extab_addr.address).min().unwrap(),
+                indices.iter().map(|&i| entries[i].extab_addr.address).max().unwrap(),
+            );
+        }
+
+        // Validate all entries and collect symbol info for the group.
+        let mut function_symbols = Vec::new();
+        let mut extab_symbols = Vec::new();
+        for &idx in &indices {
+            let entry = &entries[idx];
+            let Some((_, eti_symbol)) = obj.symbols.kind_at_section_address(
+                entry.eti_address.section,
+                entry.eti_address.address,
+                ObjSymbolKind::Object,
+            )?
+            else {
+                bail!("Failed to find extabindex symbol @ {:#010X}", entry.eti_address);
+            };
+            ensure!(
+                eti_symbol.size_known && eti_symbol.size == 12,
+                "extabindex symbol {} has mismatched size ({:#X}, expected {:#X})",
+                eti_symbol.name,
+                eti_symbol.size,
+                12
+            );
+
+            let Some((_, function_symbol)) = obj.symbols.kind_at_section_address(
+                entry.function_addr.section,
+                entry.function_addr.address,
+                ObjSymbolKind::Function,
+            )?
+            else {
+                bail!("Failed to find function symbol @ {:#010X}", entry.function_addr);
+            };
+            ensure!(
+                function_symbol.size_known && function_symbol.size == entry.function_size as u64,
+                "Function symbol {} has mismatched size ({:#X}, expected {:#X})",
+                function_symbol.name,
+                function_symbol.size,
+                entry.function_size
+            );
+            function_symbols.push(function_symbol.clone());
+
+            let Some((_, extab_symbol)) = obj.symbols.kind_at_section_address(
+                entry.extab_addr.section,
+                entry.extab_addr.address,
+                ObjSymbolKind::Object,
+            )?
+            else {
+                bail!("Failed to find extab symbol @ {:#010X}", entry.extab_addr);
+            };
+            ensure!(
+                extab_symbol.size_known && extab_symbol.size > 0,
+                "extab symbol {} has unknown size",
+                extab_symbol.name
+            );
+            extab_symbols.push(extab_symbol.clone());
+        }
+
+        if is_reversed {
+            // For reversed groups, determine a single unit name and create covering splits.
+            let mut expected_unit: Option<String> = None;
+
+            // Check all entries for existing user-defined splits.
+            for &idx in &indices {
+                let entry = &entries[idx];
+                let text_section = &obj.sections[entry.function_addr.section];
+                for (_, split) in [
+                    section.splits.for_address(entry.eti_address.address),
+                    extab_section.splits.for_address(entry.extab_addr.address),
+                    text_section.splits.for_address(entry.function_addr.address),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Some(unit) = &expected_unit {
+                        ensure!(
+                            unit == &split.unit,
+                            "Conflicting splits within reversed extab group: {} != {}",
+                            unit,
+                            split.unit,
+                        );
+                    } else {
+                        expected_unit = Some(split.unit.clone());
+                    }
+                }
+            }
+
             let unit = match expected_unit {
                 Some(unit) => unit,
-                None => auto_unit_name(obj, function_symbol, &new_splits)?,
+                None => auto_unit_name(obj, &function_symbols[0], &new_splits)?,
             };
-            log::debug!("Adding splits to unit {}", unit);
+            log::debug!("Adding reversed group splits to unit {}", unit);
 
-            if extabindex_split.is_none() {
-                let end = current_address + 12;
-                log::debug!(
-                    "Adding split for extabindex entry @ {:#010X}-{:#010X}",
-                    current_address,
-                    end
-                );
-                new_splits.insert(current_address, ObjSplit {
-                    unit: unit.clone(),
-                    end: end.address,
-                    align: None,
-                    common: false,
-                    autogenerated: true,
-                    skip: false,
-                    rename: None,
-                });
+            // Compute covering ranges across all entries in the group.
+            // Entries may not be contiguous indices (due to backward absorption).
+            let eti_min = indices.iter().map(|&i| entries[i].eti_address).min().unwrap();
+            let eti_max = indices.iter().map(|&i| entries[i].eti_address).max().unwrap();
+            let eti_end = eti_max + 12;
+
+            let extab_min = indices.iter().map(|&i| entries[i].extab_addr).min().unwrap();
+            let (extab_max_local_idx, _) = indices
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &i)| entries[i].extab_addr.address)
+                .unwrap();
+            let extab_max_entry = &entries[indices[extab_max_local_idx]];
+            let extab_end =
+                extab_max_entry.extab_addr + extab_symbols[extab_max_local_idx].size as u32;
+
+            let func_min = indices.iter().map(|&i| entries[i].function_addr).min().unwrap();
+            let (func_max_local_idx, _) = indices
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &i)| entries[i].function_addr.address)
+                .unwrap();
+            let func_max_entry = &entries[indices[func_max_local_idx]];
+            let func_end = func_max_entry.function_addr + func_max_entry.function_size;
+
+            // Create one covering split per section type.
+            log::debug!("Adding split for extabindex group @ {:#010X}-{:#010X}", eti_min, eti_end);
+            new_splits.insert(eti_min, ObjSplit {
+                unit: unit.clone(),
+                end: eti_end.address,
+                align: None,
+                common: false,
+                autogenerated: true,
+                skip: false,
+                rename: None,
+            });
+            log::debug!("Adding split for extab group @ {:#010X}-{:#010X}", extab_min, extab_end);
+            new_splits.insert(extab_min, ObjSplit {
+                unit: unit.clone(),
+                end: extab_end.address,
+                align: None,
+                common: false,
+                autogenerated: true,
+                skip: false,
+                rename: None,
+            });
+            log::debug!("Adding split for function group @ {:#010X}-{:#010X}", func_min, func_end);
+            new_splits.insert(func_min, ObjSplit {
+                unit,
+                end: func_end.address,
+                align: None,
+                common: false,
+                autogenerated: true,
+                skip: false,
+                rename: None,
+            });
+        } else {
+            // Single-entry group
+            let entry = &entries[indices[0]];
+            let function_symbol = &function_symbols[0];
+            let extab_symbol = &extab_symbols[0];
+            let text_section = &obj.sections[entry.function_addr.section];
+
+            let extabindex_split = section.splits.for_address(entry.eti_address.address);
+            let extab_split = extab_section.splits.for_address(entry.extab_addr.address);
+            let function_split = text_section.splits.for_address(entry.function_addr.address);
+
+            let mut expected_unit = None;
+            if let Some((_, split)) = extabindex_split {
+                expected_unit = Some(split.unit.clone());
             }
-            if extab_split.is_none() {
-                let end = extab_addr + extab_symbol.size as u32;
-                log::debug!("Adding split for extab @ {:#010X}-{:#010X}", extab_addr, end);
-                new_splits.insert(extab_addr, ObjSplit {
-                    unit: unit.clone(),
-                    end: end.address,
-                    align: None,
-                    common: false,
-                    autogenerated: true,
-                    skip: false,
-                    rename: None,
-                });
+            if let Some((_, split)) = extab_split {
+                if let Some(unit) = &expected_unit {
+                    ensure!(
+                        unit == &split.unit,
+                        "Mismatched splits for extabindex {:#010X} ({}) and extab {:#010X} ({})",
+                        entry.eti_address,
+                        unit,
+                        entry.extab_addr,
+                        split.unit
+                    );
+                } else {
+                    expected_unit = Some(split.unit.clone());
+                }
             }
-            if function_split.is_none() {
-                let end = function_addr + function_symbol.size as u32;
-                log::debug!("Adding split for function @ {:#010X}-{:#010X}", function_addr, end);
-                new_splits.insert(function_addr, ObjSplit {
-                    unit,
-                    end: end.address,
-                    align: None,
-                    common: false,
-                    autogenerated: true,
-                    skip: false,
-                    rename: None,
-                });
+            if let Some((_, split)) = function_split {
+                if let Some(unit) = &expected_unit {
+                    ensure!(
+                        unit == &split.unit,
+                        "Mismatched splits for extabindex {:#010X} ({}) and function {:#010X} ({})",
+                        entry.eti_address,
+                        unit,
+                        entry.function_addr,
+                        split.unit
+                    );
+                } else {
+                    expected_unit = Some(split.unit.clone());
+                }
+            }
+
+            if extabindex_split.is_none() || extab_split.is_none() || function_split.is_none() {
+                let unit = match expected_unit {
+                    Some(unit) => unit,
+                    None => auto_unit_name(obj, function_symbol, &new_splits)?,
+                };
+                log::debug!("Adding splits to unit {}", unit);
+
+                if extabindex_split.is_none() {
+                    let end = entry.eti_address + 12;
+                    log::debug!(
+                        "Adding split for extabindex entry @ {:#010X}-{:#010X}",
+                        entry.eti_address,
+                        end
+                    );
+                    new_splits.insert(entry.eti_address, ObjSplit {
+                        unit: unit.clone(),
+                        end: end.address,
+                        align: None,
+                        common: false,
+                        autogenerated: true,
+                        skip: false,
+                        rename: None,
+                    });
+                }
+                if extab_split.is_none() {
+                    let end = entry.extab_addr + extab_symbol.size as u32;
+                    log::debug!(
+                        "Adding split for extab @ {:#010X}-{:#010X}",
+                        entry.extab_addr,
+                        end
+                    );
+                    new_splits.insert(entry.extab_addr, ObjSplit {
+                        unit: unit.clone(),
+                        end: end.address,
+                        align: None,
+                        common: false,
+                        autogenerated: true,
+                        skip: false,
+                        rename: None,
+                    });
+                }
+                if function_split.is_none() {
+                    let end = entry.function_addr + function_symbol.size as u32;
+                    log::debug!(
+                        "Adding split for function @ {:#010X}-{:#010X}",
+                        entry.function_addr,
+                        end
+                    );
+                    new_splits.insert(entry.function_addr, ObjSplit {
+                        unit,
+                        end: end.address,
+                        align: None,
+                        common: false,
+                        autogenerated: true,
+                        skip: false,
+                        rename: None,
+                    });
+                }
             }
         }
-
-        current_address += 12;
     }
 
     for (addr, split) in new_splits {
@@ -503,8 +833,7 @@ fn validate_splits(obj: &ObjInfo) -> Result<()> {
         if let Some((_, symbol)) = obj
             .symbols
             .for_section_range(section_index, ..addr)
-            .filter(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
-            .next_back()
+            .rfind(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
         {
             ensure!(
                 addr >= symbol.address as u32 + symbol.size as u32,
@@ -522,8 +851,7 @@ fn validate_splits(obj: &ObjInfo) -> Result<()> {
         if let Some((_, symbol)) = obj
             .symbols
             .for_section_range(section_index, ..split.end)
-            .filter(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
-            .next_back()
+            .rfind(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
         {
             ensure!(
                 split.end >= symbol.address as u32 + symbol.size as u32,
@@ -561,6 +889,7 @@ fn add_padding_symbols(obj: &mut ObjInfo) -> Result<()> {
         {
             let next_split_address = splits
                 .peek()
+                .filter(|(i, _, _, _)| *i == section_index)
                 .map(|(_, _, addr, _)| *addr as u64)
                 .unwrap_or(section.address + section.size);
             let next_symbol_address = obj
@@ -643,7 +972,9 @@ fn add_padding_symbols(obj: &mut ObjInfo) -> Result<()> {
 
             // Check if symbol is missing data between the end of the symbol and the next symbol
             let symbol_end = (symbol.address + symbol.size) as u32;
-            if section.kind != ObjSectionKind::Code && next_address > symbol_end {
+            if !matches!(section.kind, ObjSectionKind::Code | ObjSectionKind::Bss)
+                && next_address > symbol_end
+            {
                 let data = section.data_range(symbol_end, next_address)?;
                 if data.iter().any(|&x| x != 0) {
                     log::debug!(
@@ -652,7 +983,7 @@ fn add_padding_symbols(obj: &mut ObjInfo) -> Result<()> {
                         next_address
                     );
                     let name = if obj.module_id == 0 {
-                        format!("lbl_{:08X}", symbol_end)
+                        format!("lbl_{symbol_end:08X}")
                     } else {
                         format!(
                             "lbl_{}_{}_{:X}",
@@ -743,8 +1074,7 @@ fn trim_split_alignment(obj: &mut ObjInfo) -> Result<()> {
         if let Some((_, symbol)) = obj
             .symbols
             .for_section_range(section_index, addr..split.end)
-            .filter(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
-            .next_back()
+            .rfind(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
         {
             split_end = symbol.address as u32 + symbol.size as u32;
         }
@@ -971,7 +1301,11 @@ fn resolve_link_order(obj: &ObjInfo) -> Result<Vec<ObjUnit>> {
 
 /// Split an object into multiple relocatable objects.
 #[instrument(level = "debug", skip(obj))]
-pub fn split_obj(obj: &ObjInfo, module_name: Option<&str>) -> Result<Vec<ObjInfo>> {
+pub fn split_obj(
+    obj: &ObjInfo,
+    module_name: Option<&str>,
+    globalize_symbols: bool,
+) -> Result<Vec<ObjInfo>> {
     let mut objects: Vec<ObjInfo> = vec![];
     let mut object_symbols: Vec<Vec<Option<SymbolIndex>>> = vec![];
     let mut name_to_obj: HashMap<String, usize> = HashMap::new();
@@ -1194,7 +1528,7 @@ pub fn split_obj(obj: &ObjInfo, module_name: Option<&str>) -> Result<Vec<ObjInfo
     }
 
     // Update relocations
-    let mut globalize_symbols = vec![];
+    let mut symbols_to_globalize = vec![];
     for (obj_idx, out_obj) in objects.iter_mut().enumerate() {
         let symbol_idxs = &mut object_symbols[obj_idx];
         for (_section_index, section) in out_obj.sections.iter_mut() {
@@ -1210,7 +1544,7 @@ pub fn split_obj(obj: &ObjInfo, module_name: Option<&str>) -> Result<Vec<ObjInfo
 
                         // If the symbol is local, we'll upgrade the scope to global
                         // and rename it to avoid conflicts
-                        if target_sym.flags.is_local() {
+                        if globalize_symbols && target_sym.flags.is_local() {
                             let address_str = if obj.module_id == 0 {
                                 format!("{:08X}", target_sym.address)
                             } else if let Some(section_index) = target_sym.section {
@@ -1229,7 +1563,7 @@ pub fn split_obj(obj: &ObjInfo, module_name: Option<&str>) -> Result<Vec<ObjInfo
                             } else {
                                 format!("{}_{}", target_sym.name, address_str)
                             };
-                            globalize_symbols.push((reloc.target_symbol, new_name));
+                            symbols_to_globalize.push((reloc.target_symbol, new_name));
                         }
 
                         symbol_idxs[reloc.target_symbol as usize] = Some(out_sym_idx);
@@ -1274,16 +1608,18 @@ pub fn split_obj(obj: &ObjInfo, module_name: Option<&str>) -> Result<Vec<ObjInfo
     }
 
     // Upgrade local symbols to global if necessary
-    for (obj, symbol_map) in objects.iter_mut().zip(&object_symbols) {
-        for (globalize_idx, new_name) in &globalize_symbols {
-            if let Some(symbol_idx) = symbol_map[*globalize_idx as usize] {
-                let mut symbol = obj.symbols[symbol_idx].clone();
-                symbol.name.clone_from(new_name);
-                if symbol.flags.is_local() {
-                    log::debug!("Globalizing {} in {}", symbol.name, obj.name);
-                    symbol.flags.set_scope(ObjSymbolScope::Global);
+    if globalize_symbols {
+        for (obj, symbol_map) in objects.iter_mut().zip(&object_symbols) {
+            for (globalize_idx, new_name) in &symbols_to_globalize {
+                if let Some(symbol_idx) = symbol_map[*globalize_idx as usize] {
+                    let mut symbol = obj.symbols[symbol_idx].clone();
+                    symbol.name.clone_from(new_name);
+                    if symbol.flags.is_local() {
+                        log::debug!("Globalizing {} in {}", symbol.name, obj.name);
+                        symbol.flags.set_scope(ObjSymbolScope::Global);
+                    }
+                    obj.symbols.replace(symbol_idx, symbol)?;
                 }
-                obj.symbols.replace(symbol_idx, symbol)?;
             }
         }
     }
@@ -1412,16 +1748,13 @@ pub fn end_for_section(obj: &ObjInfo, section_index: SectionIndex) -> Result<Sec
         section_end -= 4;
     }
     loop {
-        let last_symbol = obj
-            .symbols
-            .for_section_range(section_index, ..section_end)
-            .filter(|(_, s)| {
+        let last_symbol =
+            obj.symbols.for_section_range(section_index, ..section_end).rfind(|(_, s)| {
                 s.kind == ObjSymbolKind::Object
                     && s.size_known
                     && s.size > 0
                     && !s.flags.is_stripped()
-            })
-            .next_back();
+            });
         match last_symbol {
             Some((_, symbol)) if is_linker_generated_object(&symbol.name) => {
                 log::debug!(
@@ -1455,14 +1788,14 @@ fn auto_unit_name(
         length_limit: 20,
         ..Default::default()
     })
-    // Also replace $ to avoid issues with build.ninja
-    .replace('$', "_");
+    // Also replace characters that break downstream tooling (build.ninja, linker, etc)
+    .replace(['$', ','], "_");
     let mut unit_name = format!("auto_{}_{}", name, section_name.trim_start_matches('.'));
     // Ensure the name is unique
     if unit_exists(&unit_name, obj, new_splits) {
         let mut i = 1;
         loop {
-            let new_unit_name = format!("{}_{}", unit_name, i);
+            let new_unit_name = format!("{unit_name}_{i}");
             if !unit_exists(&new_unit_name, obj, new_splits) {
                 unit_name = new_unit_name;
                 break;

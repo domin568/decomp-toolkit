@@ -1,26 +1,26 @@
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{HashMap, hash_map},
     io::Cursor,
     num::NonZeroU64,
     path::Path,
 };
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use cwdemangle::demangle;
 use flagset::Flags;
 use indexmap::IndexMap;
-use objdiff_core::obj::split_meta::{SplitMeta, SHT_SPLITMETA, SPLITMETA_SECTION};
+use objdiff_core::obj::split_meta::{SHT_SPLITMETA, SPLITMETA_SECTION, SplitMeta};
 use object::{
+    Architecture, Endianness, File, Object, ObjectKind, ObjectSection, ObjectSymbol, Relocation,
+    RelocationFlags, RelocationTarget, SectionKind, Symbol, SymbolKind, SymbolScope, SymbolSection,
     elf,
     elf::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_LOUSER, SHT_NOBITS, SHT_PROGBITS},
     write::{
-        elf::{ProgramHeader, Rel, SectionHeader, SectionIndex, SymbolIndex, Writer},
         StringId,
+        elf::{ProgramHeader, Rel, SectionHeader, SectionIndex, SymbolIndex, Writer},
     },
-    Architecture, Endianness, File, Object, ObjectKind, ObjectSection, ObjectSymbol, Relocation,
-    RelocationFlags, RelocationTarget, SectionKind, Symbol, SymbolKind, SymbolScope, SymbolSection,
 };
-use typed_path::Utf8NativePath;
+use typed_path::{Utf8NativePath, Utf8NativePathBuf};
 
 use crate::{
     array_ref,
@@ -164,7 +164,7 @@ pub fn process_elf(path: &Utf8NativePath) -> Result<ObjInfo> {
                             hash_map::Entry::Vacant(e) => e.insert(0),
                         };
                         *index += 1;
-                        let new_name = format!("{}_{}", file_name, index);
+                        let new_name = format!("{file_name}_{index}");
                         // log::info!("Renaming {} to {}", file_name, new_name);
                         file_name.clone_from(&new_name);
                         match section_starts.entry(new_name.clone()) {
@@ -275,8 +275,8 @@ pub fn process_elf(path: &Utf8NativePath) -> Result<ObjInfo> {
             continue;
         }
         symbol_indexes.push(Some(symbols.len() as ObjSymbolIndex));
-        let align = mw_comment.as_ref().map(|(_, vec)| vec[symbol.index().0].align);
-        symbols.push(to_obj_symbol(&obj_file, &symbol, &section_indexes, align)?);
+        let comment_sym = mw_comment.as_ref().map(|(_, vec)| &vec[symbol.index().0 - 1]);
+        symbols.push(to_obj_symbol(&obj_file, &symbol, &section_indexes, comment_sym)?);
     }
 
     let mut link_order = Vec::<ObjUnit>::new();
@@ -374,6 +374,7 @@ fn load_comment(obj_file: &File) -> Result<Option<(MWComment, Vec<CommentSym>)>>
     let mut reader = Cursor::new(&*data);
     let header = MWComment::from_reader(&mut reader, Endian::Big)?;
     log::debug!("Loaded .comment section header {:?}", header);
+    CommentSym::from_reader(&mut reader, Endian::Big)?; // Null symbol
     let mut comment_syms = Vec::with_capacity(obj_file.symbols().count());
     for symbol in obj_file.symbols() {
         let comment_sym = CommentSym::from_reader(&mut reader, Endian::Big)?;
@@ -861,7 +862,7 @@ fn to_obj_symbol(
     obj_file: &object::File<'_>,
     symbol: &Symbol<'_, '_>,
     section_indexes: &[Option<usize>],
-    align: Option<u32>,
+    comment_sym: Option<&CommentSym>,
 ) -> Result<ObjSymbol> {
     let section = match symbol.section_index() {
         Some(idx) => Some(obj_file.section_by_index(idx)?),
@@ -891,6 +892,9 @@ fn to_obj_symbol(
     if symbol.scope() == SymbolScope::Linkage {
         flags = ObjSymbolFlagSet(flags.0 | ObjSymbolFlags::Hidden);
     }
+    if comment_sym.is_some_and(|c| c.active_flags & 0x8 != 0) {
+        flags = ObjSymbolFlagSet(flags.0 | ObjSymbolFlags::Exported);
+    }
     let section_idx = section.as_ref().and_then(|section| section_indexes[section.index().0]);
     Ok(ObjSymbol {
         name: name.to_string(),
@@ -907,7 +911,7 @@ fn to_obj_symbol(
             SymbolKind::Section => ObjSymbolKind::Section,
             _ => bail!("Unsupported symbol kind: {:?}", symbol),
         },
-        align,
+        align: comment_sym.map(|c| c.align),
         ..Default::default()
     })
 }
@@ -1004,4 +1008,11 @@ fn write_relocatable_section_data(w: &mut Writer, section: &ObjSection) -> Resul
     // Write remaining data
     w.write(&section.data[current_address..]);
     Ok(())
+}
+
+pub fn is_elf_file(path: &Utf8NativePathBuf) -> Result<bool> {
+    let mut file = open_file(path, true)?;
+    let mut magic = [0; 4];
+    file.read_exact(&mut magic)?;
+    Ok(magic == elf::ELFMAG)
 }

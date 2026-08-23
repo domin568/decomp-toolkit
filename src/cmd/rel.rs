@@ -1,11 +1,11 @@
 use std::{
-    collections::{btree_map, BTreeMap},
+    collections::{BTreeMap, btree_map},
     fs,
     io::{Cursor, Write},
     time::Instant,
 };
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use argp::FromArgs;
 use object::{
     Architecture, Endianness, File, Object, ObjectSection, ObjectSymbol, RelocationTarget,
@@ -27,23 +27,23 @@ use crate::{
         tracker::Tracker,
     },
     array_ref_mut,
-    cmd::dol::{find_object_base, ModuleConfig, ObjectBase, ProjectConfig},
+    cmd::dol::{ModuleConfig, ObjectBase, ProjectConfig, find_object_base},
     obj::{
         ObjInfo, ObjReloc, ObjRelocKind, ObjSection, ObjSectionKind, ObjSymbol,
         SectionIndex as ObjSectionIndex,
     },
     util::{
-        config::{is_auto_symbol, read_splits_sections, SectionDef},
+        IntoCow, ToCow,
+        config::{SectionDef, is_auto_symbol, read_splits_sections},
         dol::process_dol,
         elf::{to_obj_reloc_kind, write_elf},
-        file::{buf_writer, process_rsp, verify_hash, FileIterator},
+        file::{FileIterator, buf_writer, process_rsp, verify_hash},
         nested::NestedMap,
         path::native_path,
         rel::{
+            PERMITTED_SECTIONS, RelHeader, RelReloc, RelSectionHeader, RelWriteInfo,
             print_relocations, process_rel, process_rel_header, process_rel_sections, write_rel,
-            RelHeader, RelReloc, RelSectionHeader, RelWriteInfo, PERMITTED_SECTIONS,
         },
-        IntoCow, ToCow,
     },
     vfs::open_file,
 };
@@ -104,6 +104,9 @@ pub struct MakeArgs {
     #[argp(option, short = 'n')]
     /// (optional) module names
     names: Vec<String>,
+    #[argp(option, short = 'v')]
+    /// (optional) REL version (default is 3)
+    version: Option<u32>,
     #[argp(switch, short = 'w')]
     /// disable warnings
     no_warn: bool,
@@ -120,7 +123,7 @@ pub fn run(args: Args) -> Result<()> {
     }
 }
 
-fn load_obj(buf: &[u8]) -> Result<File> {
+fn load_obj(buf: &[u8]) -> Result<File<'_>> {
     let obj = File::parse(buf)?;
     match obj.architecture() {
         Architecture::PowerPc => {}
@@ -297,7 +300,15 @@ fn make(args: MakeArgs) -> Result<()> {
     }
 
     // Load all modules
-    let mut files = paths.iter().map(|p| open_file(p, true)).collect::<Result<Vec<_>>>()?;
+    let mut files = paths
+        .iter()
+        .map(|p| {
+            let mut file = open_file(p, true)?;
+            // Immediately map to avoid keeping file handles open
+            file.map()?;
+            Ok(file)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let modules = files
         .par_iter_mut()
         .enumerate()
@@ -313,7 +324,7 @@ fn make(args: MakeArgs) -> Result<()> {
                 .unwrap_or(idx as u32);
             load_obj(file.map()?)
                 .map(|o| LoadedModule { module_id, file: o, path: path.clone() })
-                .with_context(|| format!("Failed to load '{}'", path))
+                .with_context(|| format!("Failed to load '{path}'"))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -364,7 +375,7 @@ fn make(args: MakeArgs) -> Result<()> {
         let _span = info_span!("file", path = %module_info.path).entered();
         let mut info = RelWriteInfo {
             module_id: module_info.module_id,
-            version: 3,
+            version: args.version.unwrap_or(3),
             name_offset: None,
             name_size: None,
             align: None,
@@ -392,7 +403,7 @@ fn make(args: MakeArgs) -> Result<()> {
         let rel_path = module_info.path.with_extension("rel");
         let mut w = buf_writer(&rel_path)?;
         write_rel(&mut w, &info, &module_info.file, relocations)
-            .with_context(|| format!("Failed to write '{}'", rel_path))?;
+            .with_context(|| format!("Failed to write '{rel_path}'"))?;
         w.flush()?;
     }
 

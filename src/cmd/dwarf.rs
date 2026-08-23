@@ -1,14 +1,15 @@
 use std::{
-    collections::{btree_map, BTreeMap},
-    io::{stdout, Cursor, Read, Write},
+    cell::RefCell,
+    collections::btree_map,
+    io::{Cursor, Read, Write, stdout},
     ops::Bound::{Excluded, Unbounded},
     str::from_utf8,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use argp::FromArgs;
 use object::{
-    elf, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, Section,
+    Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, Section, elf,
 };
 use syntect::{
     highlighting::{Color, HighlightIterator, HighlightState, Highlighter, Theme, ThemeSet},
@@ -19,8 +20,9 @@ use typed_path::Utf8NativePathBuf;
 use crate::{
     util::{
         dwarf::{
-            process_compile_unit, process_cu_tag, process_overlay_branch, read_debug_section,
-            should_skip_tag, tag_type_string, AttributeKind, TagKind,
+            AttributeKind, MemberFunctionMap, TagKind, TypedefMap, parse_producer,
+            preprocess_cu_tag, print::tag_type_string, process_compile_unit, process_cu_tag,
+            process_overlay_branch, read_debug_section, should_skip_tag,
         },
         file::buf_writer,
         path::native_path,
@@ -104,16 +106,16 @@ fn dump(args: DumpArgs) -> Result<()> {
                 // TODO make a basename method
                 let name = name.trim_start_matches("D:").replace('\\', "/");
                 let name = name.rsplit_once('/').map(|(_, b)| b).unwrap_or(&name);
-                let file_path = out_path.join(format!("{}.txt", name));
+                let file_path = out_path.join(format!("{name}.txt"));
                 let mut file = buf_writer(&file_path)?;
                 dump_debug_section(&args, &mut file, &obj_file, debug_section)?;
                 file.flush()?;
             } else if args.no_color {
-                println!("\n// File {}:", name);
+                println!("\n// File {name}:");
                 dump_debug_section(&args, &mut stdout(), &obj_file, debug_section)?;
             } else {
                 let mut writer = HighlightWriter::new(syntax_set.clone(), syntax.clone(), theme);
-                writeln!(writer, "\n// File {}:", name)?;
+                writeln!(writer, "\n// File {name}:")?;
                 dump_debug_section(&args, &mut writer, &obj_file, debug_section)?;
             }
         }
@@ -166,7 +168,8 @@ where
     }
 
     let mut reader = Cursor::new(&*data);
-    let info = read_debug_section(&mut reader, obj_file.endianness().into(), args.include_erased)?;
+    let mut info =
+        read_debug_section(&mut reader, obj_file.endianness().into(), args.include_erased)?;
 
     for (&addr, tag) in &info.tags {
         log::debug!("{}: {:?}", addr, tag);
@@ -209,26 +212,26 @@ where
                     }
                     writeln!(w, "\n/*\n    Compile unit: {}", unit.name)?;
                     if let Some(producer) = unit.producer {
-                        writeln!(w, "    Producer: {}", producer)?;
+                        writeln!(w, "    Producer: {producer}")?;
+                        info.producer = parse_producer(&producer);
                     }
                     if let Some(comp_dir) = unit.comp_dir {
-                        writeln!(w, "    Compile directory: {}", comp_dir)?;
+                        writeln!(w, "    Compile directory: {comp_dir}")?;
                     }
                     if let Some(language) = unit.language {
-                        writeln!(w, "    Language: {}", language)?;
+                        writeln!(w, "    Language: {language}")?;
                     }
                     if let (Some(start), Some(end)) = (unit.start_address, unit.end_address) {
-                        writeln!(w, "    Code range: {:#010X} -> {:#010X}", start, end)?;
+                        writeln!(w, "    Code range: {start:#010X} -> {end:#010X}")?;
                     }
                     if let Some(gcc_srcfile_name_offset) = unit.gcc_srcfile_name_offset {
                         writeln!(
                             w,
-                            "    GCC Source File Name Offset: {:#010X}",
-                            gcc_srcfile_name_offset
+                            "    GCC Source File Name Offset: {gcc_srcfile_name_offset:#010X}"
                         )?;
                     }
                     if let Some(gcc_srcinfo_offset) = unit.gcc_srcinfo_offset {
-                        writeln!(w, "    GCC Source Info Offset: {:#010X}", gcc_srcinfo_offset)?;
+                        writeln!(w, "    GCC Source Info Offset: {gcc_srcinfo_offset:#010X}")?;
                     }
                     writeln!(w, "*/")?;
 
@@ -246,8 +249,13 @@ where
                     }
                     children.sort_by_key(|x| x.key);
 
-                    let mut typedefs = BTreeMap::<u32, Vec<u32>>::new();
-                    for child in children {
+                    let mut typedefs = TypedefMap::new();
+                    info.member_functions = RefCell::new(MemberFunctionMap::new());
+                    // pre-parse step
+                    for &child in &children {
+                        preprocess_cu_tag(&info, child);
+                    }
+                    for &child in &children {
                         let tag_type = match process_cu_tag(&info, child) {
                             Ok(tag_type) => tag_type,
                             Err(e) => {
@@ -269,7 +277,7 @@ where
                             continue;
                         }
                         match tag_type_string(&info, &typedefs, &tag_type, child.is_erased) {
-                            Ok(s) => writeln!(w, "{}", s)?,
+                            Ok(s) => writeln!(w, "{s}")?,
                             Err(e) => {
                                 log::error!(
                                     "Failed to emit tag {:X} (unit {}): {}",
@@ -360,7 +368,7 @@ fn blend_fg_color(fg: Color, bg: Color) -> Color {
 
 impl Write for HighlightWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let str = from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let str = from_utf8(buf).map_err(std::io::Error::other)?;
         for s in str.split_inclusive('\n') {
             self.line.push_str(s);
             if self.line.ends_with('\n') {
@@ -377,7 +385,7 @@ impl Write for HighlightWriter<'_> {
         let ops = self
             .parse_state
             .parse_line(&self.line, &self.syntax_set)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         let iter = HighlightIterator::new(
             &mut self.highlight_state,
             &ops[..],

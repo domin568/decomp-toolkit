@@ -5,8 +5,8 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use cwdemangle::{demangle, DemangleOptions};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use cwdemangle::{DemangleOptions, demangle};
 use filetime::FileTime;
 use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
@@ -21,7 +21,7 @@ use crate::{
         ObjSymbolFlags, ObjSymbolKind, ObjUnit, SectionIndex,
     },
     util::{
-        file::{buf_writer, FileReadInfo},
+        file::{FileReadInfo, buf_writer},
         split::default_section_align,
     },
     vfs::open_file,
@@ -92,6 +92,22 @@ pub fn parse_symbol_line(line: &str, obj: &mut ObjInfo) -> Result<Option<ObjSymb
             Some(section_index)
         } else {
             bail!("Section {} not found", section_name)
+        };
+        // Normalize virtual addresses to section-relative for REL modules
+        let addr = if obj.kind == ObjKind::Relocatable
+            && let Some(section_idx) = section
+            && let Some(vaddr) = obj.sections.get(section_idx).and_then(|s| s.virtual_address)
+        {
+            let vaddr = vaddr as u32;
+            ensure!(
+                addr >= vaddr,
+                "Symbol address {:#010X} is below section vaddr {:#010X}",
+                addr,
+                vaddr
+            );
+            addr - vaddr
+        } else {
+            addr
         };
         let demangled_name = demangle(&name, &DemangleOptions::default());
         let mut symbol =
@@ -176,6 +192,14 @@ pub fn parse_symbol_line(line: &str, obj: &mut ObjInfo) -> Result<Option<ObjSymb
     }
 }
 
+pub fn create_auto_symbol_name(prefix: &str, module_id: u32, address: u32) -> String {
+    if module_id == 0 {
+        format!("{}_{:08X}", prefix, address)
+    } else {
+        format!("{}_{}_{:X}", prefix, module_id, address)
+    }
+}
+
 pub fn is_skip_symbol(symbol: &ObjSymbol) -> bool {
     if symbol.flags.is_no_write() {
         return true;
@@ -194,6 +218,7 @@ pub fn is_auto_symbol(symbol: &ObjSymbol) -> bool {
         || symbol.name.starts_with("jumptable_")
         || symbol.name.starts_with("gap_")
         || symbol.name.starts_with("pad_")
+        || symbol.name.starts_with("dtor_")
 }
 
 pub fn is_auto_label(symbol: &ObjSymbol) -> bool { symbol.name.starts_with("lbl_") }
@@ -267,7 +292,14 @@ where W: Write + ?Sized {
     if let Some(section) = section {
         write!(w, "{}:", section.name)?;
     }
-    write!(w, "{:#010X}; //", symbol.address)?;
+    let display_addr = if obj.kind == ObjKind::Relocatable
+        && let Some(section) = section
+    {
+        symbol.address + section.virtual_address.unwrap_or(0)
+    } else {
+        symbol.address
+    };
+    write!(w, "{:#010X}; //", display_addr)?;
     write!(w, " type:{}", symbol_kind_to_str(symbol.kind))?;
     if symbol.size_known && symbol.size > 0 {
         write!(w, " size:{:#X}", symbol.size)?;
@@ -282,11 +314,11 @@ where W: Write + ?Sized {
         write!(w, " data:{kind}")?;
     }
     if let Some(hash) = symbol.name_hash {
-        write!(w, " hash:{:#010X}", hash)?;
+        write!(w, " hash:{hash:#010X}")?;
     }
     if let Some(hash) = symbol.demangled_name_hash {
         if symbol.name_hash != symbol.demangled_name_hash {
-            write!(w, " dhash:{:#010X}", hash)?;
+            write!(w, " dhash:{hash:#010X}")?;
         }
     }
     if symbol.flags.is_hidden() {
@@ -329,8 +361,10 @@ fn symbol_data_kind_to_str(kind: ObjDataKind) -> Option<&'static str> {
         ObjDataKind::Float => Some("float"),
         ObjDataKind::Double => Some("double"),
         ObjDataKind::String => Some("string"),
+        ObjDataKind::ShiftJIS => Some("sjis"),
         ObjDataKind::String16 => Some("wstring"),
         ObjDataKind::StringTable => Some("string_table"),
+        ObjDataKind::ShiftJISTable => Some("sjis_table"),
         ObjDataKind::String16Table => Some("wstring_table"),
         ObjDataKind::Int => Some("int"),
         ObjDataKind::Short => Some("short"),
@@ -382,8 +416,10 @@ fn symbol_data_kind_from_str(s: &str) -> Option<ObjDataKind> {
         "float" => Some(ObjDataKind::Float),
         "double" => Some(ObjDataKind::Double),
         "string" => Some(ObjDataKind::String),
+        "sjis" => Some(ObjDataKind::ShiftJIS),
         "wstring" => Some(ObjDataKind::String16),
         "string_table" => Some(ObjDataKind::StringTable),
+        "sjis_table" => Some(ObjDataKind::ShiftJISTable),
         "wstring_table" => Some(ObjDataKind::String16Table),
         "int" => Some(ObjDataKind::Int),
         "short" => Some(ObjDataKind::Short),
@@ -430,15 +466,20 @@ where W: Write + ?Sized {
         if section.align > 0 {
             write!(w, " align:{}", section.align)?;
         }
+        if obj.kind == ObjKind::Relocatable
+            && let Some(vaddr) = section.virtual_address
+        {
+            write!(w, " vaddr:{:#010X}", vaddr)?;
+        }
         writeln!(w)?;
     }
     for unit in obj.link_order.iter().filter(|unit| all || !unit.autogenerated) {
         write!(w, "\n{}:", unit.name)?;
         if let Some(comment_version) = unit.comment_version {
-            write!(w, " comment:{}", comment_version)?;
+            write!(w, " comment:{comment_version}")?;
         }
         if let Some(order) = unit.order {
-            write!(w, " order:{}", order)?;
+            write!(w, " order:{order}")?;
         }
         writeln!(w)?;
         let mut split_iter = obj.sections.all_splits().peekable();
@@ -451,17 +492,28 @@ where W: Write + ?Sized {
             } else {
                 split_iter.peek().map(|&(_, _, addr, _)| addr).unwrap_or(0)
             };
-            write!(w, "\t{:<11} start:{:#010X} end:{:#010X}", section.name, addr, end)?;
+            let vaddr_offset = if obj.kind == ObjKind::Relocatable {
+                section.virtual_address.unwrap_or(0) as u32
+            } else {
+                0
+            };
+            write!(
+                w,
+                "\t{:<11} start:{:#010X} end:{:#010X}",
+                section.name,
+                addr + vaddr_offset,
+                end + vaddr_offset
+            )?;
             if let Some(align) = split.align {
                 if align != default_section_align(section) as u32 {
-                    write!(w, " align:{}", align)?;
+                    write!(w, " align:{align}")?;
                 }
             }
             if split.common {
                 write!(w, " common")?;
             }
             if let Some(name) = &split.rename {
-                write!(w, " rename:{}", name)?;
+                write!(w, " rename:{name}")?;
             }
             if split.skip {
                 write!(w, " skip")?;
@@ -495,6 +547,7 @@ pub struct SectionDef {
     pub name: String,
     pub kind: Option<ObjSectionKind>,
     pub align: Option<u32>,
+    pub vaddr: Option<u32>,
 }
 
 enum SplitLine {
@@ -549,7 +602,8 @@ fn parse_unit_line(captures: Captures) -> Result<SplitLine> {
 fn parse_section_line(captures: Captures, state: &SplitState) -> Result<SplitLine> {
     if matches!(state, SplitState::Sections(_)) {
         let name = &captures["name"];
-        let mut section = SectionDef { name: name.to_string(), kind: None, align: None };
+        let mut section =
+            SectionDef { name: name.to_string(), kind: None, align: None, vaddr: None };
 
         for attr in captures["attrs"].split(' ').filter(|&s| !s.is_empty()) {
             if let Some((attr, value)) = attr.split_once(':') {
@@ -562,6 +616,9 @@ fn parse_section_line(captures: Captures, state: &SplitState) -> Result<SplitLin
                     }
                     "align" => {
                         section.align = Some(parse_u32(value)?);
+                    }
+                    "vaddr" => {
+                        section.vaddr = Some(parse_u32(value)?);
                     }
                     _ => bail!("Unknown section attribute '{attr}'"),
                 }
@@ -637,10 +694,7 @@ pub fn apply_splits<R>(r: &mut R, obj: &mut ObjInfo) -> Result<()>
 where R: BufRead + ?Sized {
     let mut state = SplitState::None;
     for result in r.lines() {
-        let line = match result {
-            Ok(line) => line,
-            Err(e) => return Err(e.into()),
-        };
+        let line = result?;
         let split_line = parse_split_line(&line, &state)?;
         match (&mut state, split_line) {
             (
@@ -661,7 +715,10 @@ where R: BufRead + ?Sized {
             (SplitState::None | SplitState::Unit(_), SplitLine::SectionsStart) => {
                 state = SplitState::Sections(0);
             }
-            (SplitState::Sections(index), SplitLine::Section(SectionDef { name, kind, align })) => {
+            (
+                SplitState::Sections(index),
+                SplitLine::Section(SectionDef { name, kind, align, vaddr }),
+            ) => {
                 let Some(obj_section) = obj.sections.get_mut(*index) else {
                     bail!(
                         "Section out of bounds: {} (index {}), object has {} sections",
@@ -679,6 +736,13 @@ where R: BufRead + ?Sized {
                 }
                 if let Some(align) = align {
                     obj_section.align = align as u64;
+                }
+                if let Some(vaddr) = vaddr {
+                    ensure!(
+                        obj.kind == ObjKind::Relocatable,
+                        "vaddr attribute is only supported for relocatable objects"
+                    );
+                    obj_section.virtual_address = Some(vaddr as u64);
                 }
                 *index += 1;
             }
@@ -705,6 +769,24 @@ where R: BufRead + ?Sized {
                         }
                     }
                 }?;
+                let section = obj.sections.get(section_index).unwrap();
+                // Normalize virtual addresses to section-relative for REL modules
+                let (start, end) = if obj.kind == ObjKind::Relocatable
+                    && let Some(vaddr) = section.virtual_address
+                {
+                    let vaddr = vaddr as u32;
+                    ensure!(
+                        start >= vaddr && end >= vaddr,
+                        "Split address {:#010X}..{:#010X} is below section {} vaddr {:#010X}",
+                        start,
+                        end,
+                        name,
+                        vaddr
+                    );
+                    (start - vaddr, end - vaddr)
+                } else {
+                    (start, end)
+                };
                 let section = obj.sections.get_mut(section_index).unwrap();
                 let section_end = (section.address + section.size) as u32;
                 ensure!(
@@ -741,10 +823,7 @@ pub fn read_splits_sections(path: &Utf8NativePath) -> Result<Option<Vec<SectionD
     let mut sections = Vec::new();
     let mut state = SplitState::None;
     for result in file.lines() {
-        let line = match result {
-            Ok(line) => line,
-            Err(e) => return Err(e.into()),
-        };
+        let line = result?;
         let split_line = parse_split_line(&line, &state)?;
         match (&mut state, split_line) {
             (SplitState::None | SplitState::Unit(_), SplitLine::SectionsStart) => {
@@ -764,11 +843,7 @@ pub fn read_splits_sections(path: &Utf8NativePath) -> Result<Option<Vec<SectionD
             _ => {}
         }
     }
-    if sections.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(sections))
-    }
+    if sections.is_empty() { Ok(None) } else { Ok(Some(sections)) }
 }
 
 pub mod signed_hex_serde {
@@ -779,7 +854,7 @@ pub mod signed_hex_serde {
         if *value < 0 {
             serializer.serialize_str(&format!("-{:#X}", -value))
         } else {
-            serializer.serialize_str(&format!("{:#X}", value))
+            serializer.serialize_str(&format!("{value:#X}"))
         }
     }
 

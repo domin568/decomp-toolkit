@@ -202,29 +202,44 @@ impl TracebackTable {
             .then(|| ext_tb_cur.read_i32::<BigEndian>().ok())
             .flatten();
 
-        let ctl_info_ = short_tb.has_controlled_storage()
-            .then(|| {
-                ext_tb_cur.read_i32::<BigEndian>().ok().and_then(|cnt| {
-                    let cnt = cnt as usize;
-                    let mut v = Vec::with_capacity(cnt);
-                    for _ in 0..cnt {
-                        v.push(ext_tb_cur.read_i32::<BigEndian>().ok()?);
-                    }
-                    Some(v)
-                })
-            })
-            .flatten();
+        // NOTE: `read` is speculative -- it is attempted at every zero word, so the vast
+        // majority of calls land on data that is not a traceback table at all. Every count
+        // or length taken from the file must therefore be bounds-checked against the data
+        // that actually remains, or a garbage value turns straight into a huge allocation.
+        let ctl_info_ = if short_tb.has_controlled_storage() {
+            let cnt = ext_tb_cur.read_i32::<BigEndian>().ok()?;
+            // A negative anchor count means this is not a traceback table.
+            let cnt = usize::try_from(cnt).ok()?;
+            let remaining =
+                ext_tb_cur.get_ref().len().saturating_sub(ext_tb_cur.position() as usize);
+            if cnt.checked_mul(4)? > remaining {
+                // Claims more anchors than the section holds: not a traceback table.
+                return None;
+            }
+            let mut v = Vec::with_capacity(cnt);
+            for _ in 0..cnt {
+                v.push(ext_tb_cur.read_i32::<BigEndian>().ok()?);
+            }
+            Some(v)
+        } else {
+            None
+        };
 
-        let name_ = short_tb.name_present()
-            .then(|| {
-                ext_tb_cur.read_u16::<BigEndian>().ok().and_then(|len| {
-                    let len = len as usize;
-                    let mut buf = vec![0; len];
-                    ext_tb_cur.read_exact(&mut buf).ok()?;
-                    String::from_utf8(buf).ok()
-                })
-            })
-            .flatten();
+        let name_ = if short_tb.name_present() {
+            let len = ext_tb_cur.read_u16::<BigEndian>().ok()? as usize;
+            let remaining =
+                ext_tb_cur.get_ref().len().saturating_sub(ext_tb_cur.position() as usize);
+            if len > remaining {
+                // Name runs past the end of the section: not a traceback table.
+                return None;
+            }
+            let mut buf = vec![0; len];
+            ext_tb_cur.read_exact(&mut buf).ok()?;
+            // Invalid UTF-8: keep the table, just drop the name (PEF names may be MacRoman).
+            String::from_utf8(buf).ok()
+        } else {
+            None
+        };
         
         let alloca_reg_ = short_tb.uses_alloca()
             .then(|| ext_tb_cur.read_i8().ok())
@@ -298,6 +313,9 @@ impl TracebackTable {
     }
 
     pub fn size(&self) -> usize {
-        (std::mem::size_of::<TracebackTableShort>() + self.ext_size + 3) & !3 // 4 byte aligned 
+        // NOTE: must use the on-disk size constant, not `size_of::<TracebackTableShort>()`.
+        // That struct is `repr(Rust)` (see the comment on `SIZE`), so its in-memory layout is
+        // not guaranteed to match the 12-byte on-disk layout that `read` actually parses.
+        (TracebackTableShort::size() + self.ext_size + 3) & !3 // 4 byte aligned
     }
 }

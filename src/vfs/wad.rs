@@ -12,10 +12,10 @@ use zerocopy::FromZeros;
 
 use crate::{
     array_ref,
-    util::wad::{align_up, process_wad, ContentMetadata, WadFile},
+    util::wad::{ContentMetadata, WadFile, align_up, process_wad},
     vfs::{
-        common::{StaticFile, WindowedFile},
         Vfs, VfsError, VfsFile, VfsFileType, VfsMetadata, VfsResult,
+        common::{StaticFile, WindowedFile},
     },
 };
 
@@ -41,7 +41,7 @@ impl WadFs {
         Ok(Self { file, wad, mtime })
     }
 
-    fn find(&self, path: &str) -> Option<WadFindResult> {
+    fn find(&self, path: &str) -> Option<WadFindResult<'_>> {
         let filename = path.trim_start_matches('/');
         if filename.contains('/') {
             return None;
@@ -118,11 +118,11 @@ impl Vfs for WadFs {
         }
         let title_id = hex::encode(self.wad.ticket().title_id);
         let mut entries = Vec::new();
-        entries.push(format!("{}.tik", title_id));
-        entries.push(format!("{}.tmd", title_id));
-        entries.push(format!("{}.cert", title_id));
+        entries.push(format!("{title_id}.tik"));
+        entries.push(format!("{title_id}.tmd"));
+        entries.push(format!("{title_id}.cert"));
         if self.wad.header.footer_size.get() > 0 {
-            entries.push(format!("{}.trailer", title_id));
+            entries.push(format!("{title_id}.trailer"));
         }
         for content in self.wad.contents() {
             entries.push(format!("{:08x}.app", content.content_index.get()));

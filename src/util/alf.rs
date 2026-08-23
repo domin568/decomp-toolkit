@@ -11,7 +11,7 @@ use crate::{
     util::{
         dol::{DolLike, DolSection, DolSectionKind},
         reader::{
-            read_string, read_vec, read_vec_args, struct_size, Endian, FromReader, DYNAMIC_SIZE,
+            DYNAMIC_SIZE, Endian, FromReader, read_string, read_vec, read_vec_args, struct_size,
         },
     },
 };
@@ -161,7 +161,7 @@ impl FromReader for AlfSymbolKind {
         match u32::from_reader(reader, e)? {
             0 => Ok(Self::Function),
             1 => Ok(Self::Object),
-            v => Err(Error::new(ErrorKind::InvalidData, format!("invalid ALF symbol kind: {}", v))),
+            v => Err(Error::new(ErrorKind::InvalidData, format!("invalid ALF symbol kind: {v}"))),
         }
     }
 }

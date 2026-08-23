@@ -5,8 +5,8 @@ use std::{
     io::{BufRead, BufWriter, Read, Seek, SeekFrom, Write},
 };
 
-use anyhow::{anyhow, Context, Result};
-use filetime::{set_file_mtime, FileTime};
+use anyhow::{Context, Result, anyhow};
+use filetime::{FileTime, set_file_mtime};
 use sha1::{Digest, Sha1};
 use typed_path::{Utf8NativePath, Utf8NativePathBuf, Utf8UnixPathBuf};
 use xxhash_rust::xxh3::xxh3_64;
@@ -14,11 +14,11 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::{
     array_ref,
     util::{
-        ncompress::{decompress_yay0, decompress_yaz0, YAY0_MAGIC, YAZ0_MAGIC},
-        path::check_path_buf,
         Bytes,
+        ncompress::{YAY0_MAGIC, YAZ0_MAGIC, decompress_yay0, decompress_yaz0},
+        path::check_path_buf,
     },
-    vfs::{open_file, VfsFile},
+    vfs::{VfsFile, open_file},
 };
 
 /// Creates a buffered writer around a file (not memory mapped).
@@ -26,7 +26,7 @@ pub fn buf_writer(path: &Utf8NativePath) -> Result<BufWriter<File>> {
     if let Some(parent) = path.parent() {
         DirBuilder::new().recursive(true).create(parent)?;
     }
-    let file = File::create(path).with_context(|| format!("Failed to create file '{}'", path))?;
+    let file = File::create(path).with_context(|| format!("Failed to create file '{path}'"))?;
     Ok(BufWriter::new(file))
 }
 
@@ -144,7 +144,7 @@ pub fn touch(path: &Utf8NativePath) -> io::Result<()> {
     }
 }
 
-pub fn decompress_if_needed(buf: &[u8]) -> Result<Bytes> {
+pub fn decompress_if_needed(buf: &[u8]) -> Result<Bytes<'_>> {
     if buf.len() > 4 {
         match *array_ref!(buf, 0, 4) {
             YAZ0_MAGIC => return decompress_yaz0(buf).map(Bytes::Owned),

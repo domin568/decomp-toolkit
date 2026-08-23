@@ -1,13 +1,15 @@
+pub mod print;
+
 use std::{
+    cell::RefCell,
     cmp::max,
-    collections::BTreeMap,
-    fmt::{Display, Formatter, Write},
+    collections::{BTreeMap, BTreeSet, btree_map},
+    fmt::{Display, Formatter},
     io::{BufRead, Cursor, Seek, SeekFrom},
     num::NonZeroU32,
 };
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use indent::indent_all_by;
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 
 use crate::{
@@ -358,16 +360,27 @@ pub struct Tag {
     pub kind: TagKind,
     pub is_erased: bool,      // Tag was deleted but has been reconstructed
     pub is_erased_root: bool, // Tag is erased and is the root of a tree of erased tags
+    pub data_endian: Endian, // Endianness of the tag data (could be different from the address endianness for erased tags)
     pub attributes: Vec<Attribute>,
 }
 
 pub type TagMap = BTreeMap<u32, Tag>;
 pub type TypedefMap = BTreeMap<u32, Vec<u32>>;
+pub type MemberFunctionMap = BTreeMap<u32, BTreeSet<u32>>;
 
 #[derive(Debug, Clone)]
 pub struct DwarfInfo {
     pub e: Endian,
     pub tags: TagMap,
+    pub producer: Producer,
+    pub member_functions: RefCell<MemberFunctionMap>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Producer {
+    MWCC,
+    GCC,
+    OTHER,
 }
 
 impl Tag {
@@ -487,7 +500,12 @@ where R: BufRead + Seek + ?Sized {
         len
     };
 
-    let mut info = DwarfInfo { e, tags: BTreeMap::new() };
+    let mut info = DwarfInfo {
+        e,
+        tags: BTreeMap::new(),
+        producer: Producer::OTHER,
+        member_functions: RefCell::new(MemberFunctionMap::new()),
+    };
     loop {
         let position = reader.stream_position()?;
         if position >= len {
@@ -499,6 +517,14 @@ where R: BufRead + Seek + ?Sized {
         }
     }
     Ok(info)
+}
+
+pub fn parse_producer(producer: &str) -> Producer {
+    match producer {
+        p if p.starts_with("MW") => Producer::MWCC,
+        p if p.starts_with("GNU C") => Producer::GCC,
+        _ => Producer::OTHER,
+    }
 }
 
 #[allow(unused)]
@@ -554,6 +580,7 @@ where
             kind: TagKind::Padding,
             is_erased,
             is_erased_root: false,
+            data_endian,
             attributes: Vec::new(),
         });
         return Ok(tags);
@@ -563,26 +590,42 @@ where
     let tag = TagKind::try_from(tag_num).context("Unknown DWARF tag type")?;
     if tag == TagKind::Padding {
         if include_erased {
-            // Erased entries that have become padding are little-endian, and we
-            // have to guess the length and tag of the first entry. We assume
-            // the entry is either a variable or a function, and read until we
-            // find the high_pc attribute. Only MwGlobalRef will follow, and
-            // these are unlikely to be confused with the length of the next
-            // entry.
+            // Erased entries that have become padding could be either
+            // little-endian or big-endian, and we have to guess the length and
+            // tag of the first entry. We assume the entry is either a variable
+            // or a function, and read until we find the high_pc attribute. Only
+            // MwGlobalRef will follow, and these are unlikely to be confused
+            // with the length of the next entry.
             let mut attributes = Vec::new();
             let mut is_function = false;
+
+            // Guess endianness based on first attribute
+            let data_endian = if is_erased {
+                data_endian
+            } else {
+                // Peek next two bytes
+                let mut buf = [0u8; 2];
+                reader.read_exact(&mut buf)?;
+                let attr_tag = u16::from_reader(&mut Cursor::new(&buf), data_endian)?;
+                reader.seek(SeekFrom::Current(-2))?;
+                match AttributeKind::try_from(attr_tag) {
+                    Ok(_) => data_endian,
+                    Err(_) => data_endian.flip(),
+                }
+            };
+
             while reader.stream_position()? < position + size as u64 {
                 // Peek next two bytes
                 let mut buf = [0u8; 2];
                 reader.read_exact(&mut buf)?;
-                let attr_tag = u16::from_reader(&mut Cursor::new(&buf), Endian::Little)?;
+                let attr_tag = u16::from_reader(&mut Cursor::new(&buf), data_endian)?;
                 reader.seek(SeekFrom::Current(-2))?;
 
                 if is_function && attr_tag != AttributeKind::MwGlobalRef as u16 {
                     break;
                 }
 
-                let attr = read_attribute(reader, Endian::Little, addr_endian)?;
+                let attr = read_attribute(reader, data_endian, addr_endian)?;
                 if attr.kind == AttributeKind::HighPc {
                     is_function = true;
                 }
@@ -594,12 +637,13 @@ where
                 kind,
                 is_erased: true,
                 is_erased_root: true,
+                data_endian,
                 attributes,
             });
 
             // Read the rest of the tags
             while reader.stream_position()? < position + size as u64 {
-                for tag in read_tags(reader, Endian::Little, addr_endian, include_erased, true)? {
+                for tag in read_tags(reader, data_endian, addr_endian, include_erased, true)? {
                     tags.push(tag);
                 }
             }
@@ -616,6 +660,7 @@ where
             kind: tag,
             is_erased,
             is_erased_root: false,
+            data_endian,
             attributes,
         });
     }
@@ -718,8 +763,12 @@ pub struct StructureType {
     pub kind: StructureKind,
     pub name: Option<String>,
     pub byte_size: Option<u32>,
+    pub member_functions: Vec<MemberSubroutineDefType>,
     pub members: Vec<StructureMember>,
+    pub static_members: Vec<VariableTag>,
     pub bases: Vec<StructureBase>,
+    pub inner_types: Vec<UserDefinedType>,
+    pub typedefs: Vec<TypedefTag>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,8 +834,36 @@ pub struct SubroutineBlock {
     pub start_address: Option<u32>,
     pub end_address: Option<u32>,
     pub variables: Vec<SubroutineVariable>,
-    pub blocks: Vec<SubroutineBlock>,
-    pub inlines: Vec<SubroutineType>,
+    pub blocks_and_inlines: Vec<SubroutineNode>,
+    pub inner_types: Vec<UserDefinedType>,
+    pub typedefs: Vec<TypedefTag>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SubroutineNode {
+    Block(SubroutineBlock),
+    Inline(SubroutineType),
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberSubroutineDefType {
+    pub name: Option<String>,
+    pub mangled_name: Option<String>,
+    pub return_type: Type,
+    pub parameters: Vec<SubroutineParameter>,
+    pub var_args: bool,
+    pub prototyped: bool,
+    pub member_of: Option<u32>,
+    pub direct_member_of: Option<u32>,
+    pub inline: bool,
+    pub virtual_: bool,
+    pub local: bool,
+    pub start_address: Option<u32>,
+    pub end_address: Option<u32>,
+    pub const_: bool,
+    pub static_member: bool,
+    pub override_: bool,
+    pub volatile_: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -799,15 +876,21 @@ pub struct SubroutineType {
     pub prototyped: bool,
     pub references: Vec<u32>,
     pub member_of: Option<u32>,
+    pub direct_member_of: Option<u32>,
     pub variables: Vec<SubroutineVariable>,
     pub inline: bool,
     pub virtual_: bool,
     pub local: bool,
     pub labels: Vec<SubroutineLabel>,
-    pub blocks: Vec<SubroutineBlock>,
-    pub inlines: Vec<SubroutineType>,
+    pub blocks_and_inlines: Vec<SubroutineNode>,
+    pub inner_types: Vec<UserDefinedType>,
+    pub typedefs: Vec<TypedefTag>,
     pub start_address: Option<u32>,
     pub end_address: Option<u32>,
+    pub const_: bool,
+    pub static_member: bool,
+    pub override_: bool,
+    pub volatile_: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -845,7 +928,7 @@ pub struct TypedefTag {
 pub enum TagType {
     Variable(VariableTag),
     Typedef(TypedefTag),
-    UserDefined(UserDefinedType),
+    UserDefined(Box<UserDefinedType>),
 }
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, IntoPrimitive, TryFromPrimitive)]
@@ -977,61 +1060,9 @@ impl Type {
         }
         match self.kind {
             TypeKind::Fundamental(ft) => ft.size(),
-            TypeKind::UserDefined(key) => {
-                let tag = info
-                    .tags
-                    .get(&key)
-                    .ok_or_else(|| anyhow!("Failed to locate user defined type {}", key))?;
-                let ud_type = ud_type(info, tag)?;
-                ud_type.size(info)
-            }
+            TypeKind::UserDefined(key) => get_udt_by_key(info, key)?.size(info),
         }
     }
-}
-
-pub fn apply_modifiers(mut str: TypeString, modifiers: &[Modifier]) -> Result<TypeString> {
-    let mut has_pointer = false;
-    for &modifier in modifiers.iter().rev() {
-        match modifier {
-            Modifier::MwPointerTo | Modifier::PointerTo => {
-                if !has_pointer && !str.suffix.is_empty() {
-                    if str.member.is_empty() {
-                        str.prefix.push_str(" (*");
-                    } else {
-                        write!(str.prefix, " ({}*", str.member)?;
-                    }
-                    str.suffix.insert(0, ')');
-                } else {
-                    str.prefix.push_str(" *");
-                }
-                has_pointer = true;
-            }
-            Modifier::ReferenceTo => {
-                if !has_pointer && !str.suffix.is_empty() {
-                    str.prefix.push_str(" (&");
-                    str.suffix.insert(0, ')');
-                } else {
-                    str.prefix.push_str(" &");
-                }
-                has_pointer = true;
-            }
-            Modifier::Const => {
-                if has_pointer {
-                    str.prefix.push_str(" const");
-                } else {
-                    str.prefix.insert_str(0, "const ");
-                }
-            }
-            Modifier::Volatile => {
-                if has_pointer {
-                    str.prefix.push_str(" volatile");
-                } else {
-                    str.prefix.insert_str(0, "volatile ");
-                }
-            }
-        }
-    }
-    Ok(str)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1052,745 +1083,6 @@ impl Display for TypeString {
         }
         Ok(())
     }
-}
-
-pub fn type_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    t: &Type,
-    include_anonymous_def: bool,
-) -> Result<TypeString> {
-    let str = match t.kind {
-        TypeKind::Fundamental(ft) => {
-            TypeString { prefix: ft.name()?.to_string(), ..Default::default() }
-        }
-        TypeKind::UserDefined(key) => {
-            if let Some(&td_key) = typedefs.get(&key).and_then(|v| v.first()) {
-                let tag = info
-                    .tags
-                    .get(&td_key)
-                    .ok_or_else(|| anyhow!("Failed to locate typedef {}", key))?;
-                let td_name = tag
-                    .string_attribute(AttributeKind::Name)
-                    .ok_or_else(|| anyhow!("typedef without name"))?;
-                TypeString { prefix: td_name.clone(), ..Default::default() }
-            } else {
-                let tag = info
-                    .tags
-                    .get(&key)
-                    .ok_or_else(|| anyhow!("Failed to locate user defined type {}", key))?;
-                ud_type_string(info, typedefs, &ud_type(info, tag)?, true, include_anonymous_def)?
-            }
-        }
-    };
-    apply_modifiers(str, &t.modifiers)
-}
-
-fn type_name(info: &DwarfInfo, typedefs: &TypedefMap, t: &Type) -> Result<String> {
-    Ok(match t.kind {
-        TypeKind::Fundamental(ft) => ft.name()?.to_string(),
-        TypeKind::UserDefined(key) => {
-            if let Some(&td_key) = typedefs.get(&key).and_then(|v| v.first()) {
-                info.tags
-                    .get(&td_key)
-                    .ok_or_else(|| anyhow!("Failed to locate typedef {}", key))?
-                    .string_attribute(AttributeKind::Name)
-                    .ok_or_else(|| anyhow!("typedef without name"))?
-                    .clone()
-            } else {
-                let tag = info
-                    .tags
-                    .get(&key)
-                    .ok_or_else(|| anyhow!("Failed to locate user defined type {}", key))?;
-                let udt = ud_type(info, tag)?;
-                udt.name().ok_or_else(|| anyhow!("User defined type without name"))?
-            }
-        }
-    })
-}
-
-fn array_type_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    t: &ArrayType,
-    include_anonymous_def: bool,
-) -> Result<TypeString> {
-    let mut out = type_string(info, typedefs, t.element_type.as_ref(), include_anonymous_def)?;
-    for dim in &t.dimensions {
-        ensure!(
-            matches!(
-                dim.index_type.kind,
-                TypeKind::Fundamental(FundType::Long | FundType::Integer)
-            ),
-            "Unsupported array index type '{}'",
-            type_string(info, typedefs, &dim.index_type, true)?
-        );
-        match dim.size {
-            None => out.suffix.insert_str(0, "[]"),
-            Some(size) => out.suffix = format!("[{}]{}", size, out.suffix),
-        };
-    }
-    Ok(out)
-}
-
-fn structure_type_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    t: &StructureType,
-    include_keyword: bool,
-    include_anonymous_def: bool,
-) -> Result<TypeString> {
-    let prefix = if let Some(name) = t.name.as_ref() {
-        if name.starts_with('@') {
-            struct_def_string(info, typedefs, t)?
-        } else if include_keyword {
-            match t.kind {
-                StructureKind::Struct => format!("struct {}", name),
-                StructureKind::Class => format!("class {}", name),
-            }
-        } else {
-            name.clone()
-        }
-    } else if include_anonymous_def {
-        struct_def_string(info, typedefs, t)?
-    } else if include_keyword {
-        match t.kind {
-            StructureKind::Struct => "struct [anonymous]".to_string(),
-            StructureKind::Class => "class [anonymous]".to_string(),
-        }
-    } else {
-        match t.kind {
-            StructureKind::Struct => "[anonymous struct]".to_string(),
-            StructureKind::Class => "[anonymous class]".to_string(),
-        }
-    };
-    Ok(TypeString { prefix, ..Default::default() })
-}
-
-fn enumeration_type_string(
-    _info: &DwarfInfo,
-    _typedefs: &TypedefMap,
-    t: &EnumerationType,
-    include_keyword: bool,
-    include_anonymous_def: bool,
-) -> Result<TypeString> {
-    let prefix = if let Some(name) = t.name.as_ref() {
-        if name.starts_with('@') {
-            enum_def_string(t)?
-        } else if include_keyword {
-            format!("enum {}", name)
-        } else {
-            name.clone()
-        }
-    } else if include_anonymous_def {
-        enum_def_string(t)?
-    } else if include_keyword {
-        "enum [anonymous]".to_string()
-    } else {
-        "[anonymous enum]".to_string()
-    };
-    Ok(TypeString { prefix, ..Default::default() })
-}
-
-fn union_type_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    t: &UnionType,
-    include_keyword: bool,
-    include_anonymous_def: bool,
-) -> Result<TypeString> {
-    let prefix = if let Some(name) = t.name.as_ref() {
-        if name.starts_with('@') {
-            union_def_string(info, typedefs, t)?
-        } else if include_keyword {
-            format!("union {}", name)
-        } else {
-            name.clone()
-        }
-    } else if include_anonymous_def {
-        union_def_string(info, typedefs, t)?
-    } else if include_keyword {
-        "union [anonymous]".to_string()
-    } else {
-        "[anonymous union]".to_string()
-    };
-    Ok(TypeString { prefix, ..Default::default() })
-}
-
-pub fn ud_type_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    t: &UserDefinedType,
-    include_keyword: bool,
-    include_anonymous_def: bool,
-) -> Result<TypeString> {
-    Ok(match t {
-        UserDefinedType::Array(t) => array_type_string(info, typedefs, t, include_anonymous_def)?,
-        UserDefinedType::Structure(t) => {
-            structure_type_string(info, typedefs, t, include_keyword, include_anonymous_def)?
-        }
-        UserDefinedType::Enumeration(t) => {
-            enumeration_type_string(info, typedefs, t, include_keyword, include_anonymous_def)?
-        }
-        UserDefinedType::Union(t) => {
-            union_type_string(info, typedefs, t, include_keyword, include_anonymous_def)?
-        }
-        UserDefinedType::Subroutine(t) => subroutine_type_string(info, typedefs, t)?,
-        UserDefinedType::PtrToMember(t) => ptr_to_member_type_string(info, typedefs, t)?,
-    })
-}
-
-fn ptr_to_member_type_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    t: &PtrToMemberType,
-) -> Result<TypeString> {
-    let ts = type_string(info, typedefs, &t.kind, true)?;
-    let containing_type = info
-        .tags
-        .get(&t.containing_type)
-        .ok_or_else(|| anyhow!("Failed to locate containing type {}", t.containing_type))?;
-    let containing_ts =
-        ud_type_string(info, typedefs, &ud_type(info, containing_type)?, false, false)?;
-    Ok(TypeString {
-        prefix: format!("{} ({}::*", ts.prefix, containing_ts.prefix),
-        suffix: format!("{}){}", containing_ts.suffix, ts.suffix),
-        ..Default::default()
-    })
-}
-
-pub fn ud_type_def(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    t: &UserDefinedType,
-    is_erased: bool,
-) -> Result<String> {
-    match t {
-        UserDefinedType::Array(t) => {
-            let ts = array_type_string(info, typedefs, t, false)?;
-            Ok(format!("// Array: {}{}", ts.prefix, ts.suffix))
-        }
-        UserDefinedType::Subroutine(t) => Ok(subroutine_def_string(info, typedefs, t, is_erased)?),
-        UserDefinedType::Structure(t) => Ok(struct_def_string(info, typedefs, t)?),
-        UserDefinedType::Enumeration(t) => Ok(enum_def_string(t)?),
-        UserDefinedType::Union(t) => Ok(union_def_string(info, typedefs, t)?),
-        UserDefinedType::PtrToMember(t) => {
-            let ts = ptr_to_member_type_string(info, typedefs, t)?;
-            Ok(format!("// PtrToMember: {}{}", ts.prefix, ts.suffix))
-        }
-    }
-}
-
-pub fn subroutine_type_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    t: &SubroutineType,
-) -> Result<TypeString> {
-    let mut out = type_string(info, typedefs, &t.return_type, true)?;
-    let mut parameters = String::new();
-    if t.parameters.is_empty() {
-        if t.var_args {
-            parameters = "...".to_string();
-        } else if t.prototyped {
-            parameters = "void".to_string();
-        }
-    } else {
-        for (idx, parameter) in t.parameters.iter().enumerate() {
-            if idx > 0 {
-                write!(parameters, ", ")?;
-            }
-            let ts = type_string(info, typedefs, &parameter.kind, true)?;
-            if let Some(name) = &parameter.name {
-                write!(parameters, "{} {}{}", ts.prefix, name, ts.suffix)?;
-            } else {
-                write!(parameters, "{}{}", ts.prefix, ts.suffix)?;
-            }
-            if let Some(location) = &parameter.location {
-                write!(parameters, " /* {} */", location)?;
-            }
-        }
-        if t.var_args {
-            write!(parameters, ", ...")?;
-        }
-    }
-    out.suffix = format!("({}){}", parameters, out.suffix);
-    if let Some(member_of) = t.member_of {
-        let tag = info
-            .tags
-            .get(&member_of)
-            .ok_or_else(|| anyhow!("Failed to locate member_of tag {}", member_of))?;
-        let base_name = tag
-            .string_attribute(AttributeKind::Name)
-            .ok_or_else(|| anyhow!("member_of tag {} has no name attribute", member_of))?;
-        out.member = format!("{}::", base_name);
-    }
-    Ok(out)
-}
-
-pub fn subroutine_def_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    t: &SubroutineType,
-    is_erased: bool,
-) -> Result<String> {
-    let mut out = String::new();
-    if is_erased {
-        out.push_str("// Erased\n");
-    } else if let (Some(start), Some(end)) = (t.start_address, t.end_address) {
-        writeln!(out, "// Range: {:#X} -> {:#X}", start, end)?;
-    }
-    let rt = type_string(info, typedefs, &t.return_type, true)?;
-    if t.local {
-        out.push_str("static ");
-    }
-    if t.inline {
-        out.push_str("inline ");
-    }
-    if t.virtual_ {
-        out.push_str("virtual ");
-    }
-    out.push_str(&rt.prefix);
-    out.push(' ');
-
-    let mut name_written = false;
-    if let Some(member_of) = t.member_of {
-        let tag = info
-            .tags
-            .get(&member_of)
-            .ok_or_else(|| anyhow!("Failed to locate member_of tag {}", member_of))?;
-        let base_name = tag
-            .string_attribute(AttributeKind::Name)
-            .ok_or_else(|| anyhow!("member_of tag {} has no name attribute", member_of))?;
-        write!(out, "{}::", base_name)?;
-
-        // Handle constructors and destructors
-        if let Some(name) = t.name.as_ref() {
-            if name == "__dt" {
-                write!(out, "~{}", base_name)?;
-                name_written = true;
-            } else if name == "__ct" {
-                write!(out, "{}", base_name)?;
-                name_written = true;
-            }
-        }
-    }
-    if !name_written {
-        if let Some(name) = t.name.as_ref() {
-            out.push_str(name);
-        }
-    }
-    let mut parameters = String::new();
-    if t.parameters.is_empty() {
-        if t.var_args {
-            parameters = "...".to_string();
-        } else if t.prototyped {
-            parameters = "void".to_string();
-        }
-    } else {
-        for (idx, parameter) in t.parameters.iter().enumerate() {
-            if idx > 0 {
-                write!(parameters, ", ")?;
-            }
-            let ts = type_string(info, typedefs, &parameter.kind, true)?;
-            if let Some(name) = &parameter.name {
-                write!(parameters, "{} {}{}", ts.prefix, name, ts.suffix)?;
-            } else {
-                write!(parameters, "{}{}", ts.prefix, ts.suffix)?;
-            }
-            if let Some(location) = &parameter.location {
-                write!(parameters, " /* {} */", location)?;
-            }
-        }
-        if t.var_args {
-            write!(parameters, ", ...")?;
-        }
-    }
-    write!(out, "({}){} {{", parameters, rt.suffix)?;
-
-    if !t.variables.is_empty() {
-        writeln!(out, "\n    // Local variables")?;
-        let mut var_out = String::new();
-        for variable in &t.variables {
-            let ts = type_string(info, typedefs, &variable.kind, true)?;
-            write!(
-                var_out,
-                "{} {}{};",
-                ts.prefix,
-                variable.name.as_deref().unwrap_or_default(),
-                ts.suffix
-            )?;
-            if let Some(location) = &variable.location {
-                write!(var_out, " // {}", location)?;
-            }
-            writeln!(var_out)?;
-        }
-        write!(out, "{}", indent_all_by(4, var_out))?;
-    }
-
-    if !t.references.is_empty() {
-        writeln!(out, "\n    // References")?;
-        for &reference in &t.references {
-            let tag = info
-                .tags
-                .get(&reference)
-                .ok_or_else(|| anyhow!("Failed to locate reference tag {}", reference))?;
-            if tag.kind == TagKind::Padding {
-                writeln!(out, "    // -> ??? ({})", reference)?;
-                continue;
-            }
-            let variable = process_variable_tag(info, tag)?;
-            writeln!(out, "    // -> {}", variable_string(info, typedefs, &variable, false)?)?;
-        }
-    }
-
-    if !t.labels.is_empty() {
-        writeln!(out, "\n    // Labels")?;
-        for label in &t.labels {
-            writeln!(out, "    {}: // {:#X}", label.name, label.address)?;
-        }
-    }
-
-    if !t.blocks.is_empty() {
-        writeln!(out, "\n    // Blocks")?;
-        for block in &t.blocks {
-            let block_str = subroutine_block_string(info, typedefs, block)?;
-            out.push_str(&indent_all_by(4, block_str));
-        }
-    }
-
-    if !t.inlines.is_empty() {
-        writeln!(out, "\n    // Inlines")?;
-        for inline in &t.inlines {
-            let inline_str = subroutine_def_string(info, typedefs, inline, is_erased)?;
-            out.push_str(&indent_all_by(4, inline_str));
-        }
-    }
-
-    writeln!(out, "}}")?;
-    Ok(out)
-}
-
-fn subroutine_block_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    block: &SubroutineBlock,
-) -> Result<String> {
-    let mut out = String::new();
-    if let Some(name) = &block.name {
-        write!(out, "{}: ", name)?;
-    } else {
-        out.push_str("/* anonymous block */ ");
-    }
-    out.push_str("{\n");
-    if let (Some(start), Some(end)) = (block.start_address, block.end_address) {
-        writeln!(out, "    // Range: {:#X} -> {:#X}", start, end)?;
-    }
-    let mut var_out = String::new();
-    for variable in &block.variables {
-        let ts = type_string(info, typedefs, &variable.kind, true)?;
-        write!(
-            var_out,
-            "{} {}{};",
-            ts.prefix,
-            variable.name.as_deref().unwrap_or_default(),
-            ts.suffix
-        )?;
-        if let Some(location) = &variable.location {
-            write!(var_out, " // {}", location)?;
-        }
-        writeln!(var_out)?;
-    }
-    write!(out, "{}", indent_all_by(4, var_out))?;
-    if !block.inlines.is_empty() {
-        writeln!(out, "\n    // Inlines")?;
-        for inline in &block.inlines {
-            let inline_str = subroutine_def_string(info, typedefs, inline, false)?;
-            out.push_str(&indent_all_by(4, inline_str));
-        }
-    }
-    for block in &block.blocks {
-        let block_str = subroutine_block_string(info, typedefs, block)?;
-        out.push_str(&indent_all_by(4, block_str));
-    }
-    writeln!(out, "}}")?;
-    Ok(out)
-}
-
-#[derive(Debug, Clone)]
-struct AnonUnion {
-    offset: u32,
-    member_index: usize,
-    member_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct AnonUnionGroup {
-    member_index: usize,
-    member_count: usize,
-}
-
-fn get_anon_unions(info: &DwarfInfo, members: &[StructureMember]) -> Result<Vec<AnonUnion>> {
-    let mut unions = Vec::<AnonUnion>::new();
-    let mut offset = u32::MAX;
-    'member: for (prev, member) in members.iter().skip(1).enumerate() {
-        if let Some(bit) = &member.bit {
-            if bit.bit_offset != 0 {
-                continue;
-            }
-        }
-        if member.offset <= members[prev].offset && member.offset != offset {
-            offset = member.offset;
-            for (i, member) in members.iter().enumerate() {
-                if member.offset == offset {
-                    for anon in &unions {
-                        if anon.member_index == i {
-                            continue 'member;
-                        }
-                    }
-                    unions.push(AnonUnion { offset, member_index: i, member_count: 0 });
-                    break;
-                }
-            }
-        }
-    }
-    for anon in &mut unions {
-        for (i, member) in members.iter().skip(anon.member_index).enumerate() {
-            if let Some(bit) = &member.bit {
-                if bit.bit_offset != 0 {
-                    continue;
-                }
-            }
-            if member.offset == anon.offset {
-                anon.member_count = i;
-            }
-        }
-        let mut max_offset = 0;
-        for member in members.iter().skip(anon.member_index).take(anon.member_count + 1) {
-            if let Some(bit) = &member.bit {
-                if bit.bit_offset != 0 {
-                    continue;
-                }
-            }
-            let size =
-                if let Some(size) = member.byte_size { size } else { member.kind.size(info)? };
-            max_offset = max(max_offset, member.offset + size);
-        }
-        for member in members.iter().skip(anon.member_index + anon.member_count) {
-            if let Some(bit) = &member.bit {
-                if bit.bit_offset != 0 {
-                    continue;
-                }
-            }
-            if member.offset >= max_offset || member.offset < anon.offset {
-                break;
-            }
-            anon.member_count += 1;
-        }
-    }
-    Ok(unions)
-}
-
-fn get_anon_union_groups(members: &[StructureMember], unions: &[AnonUnion]) -> Vec<AnonUnionGroup> {
-    let mut groups = Vec::new();
-    for anon in unions {
-        for (i, member) in
-            members.iter().skip(anon.member_index).take(anon.member_count).enumerate()
-        {
-            if let Some(bit) = &member.bit {
-                if bit.bit_offset != 0 {
-                    continue;
-                }
-            }
-            if member.offset == anon.offset {
-                let mut group =
-                    AnonUnionGroup { member_index: anon.member_index + i, member_count: 1 };
-
-                for member in
-                    members.iter().skip(anon.member_index).take(anon.member_count).skip(i + 1)
-                {
-                    if member.offset == anon.offset {
-                        break;
-                    }
-
-                    group.member_count += 1;
-                }
-
-                if group.member_count > 1 {
-                    groups.push(group);
-                }
-            }
-        }
-    }
-    groups
-}
-
-pub fn struct_def_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    t: &StructureType,
-) -> Result<String> {
-    let mut out = match t.kind {
-        StructureKind::Struct => "struct".to_string(),
-        StructureKind::Class => "class".to_string(),
-    };
-    if let Some(name) = t.name.as_ref() {
-        if name.starts_with('@') {
-            write!(out, " /* {} */", name)?;
-        } else {
-            write!(out, " {}", name)?;
-        }
-    }
-    let mut wrote_base = false;
-    for base in &t.bases {
-        if !wrote_base {
-            out.push_str(" : ");
-            wrote_base = true;
-        } else {
-            out.push_str(", ");
-        }
-        match base.visibility {
-            Some(Visibility::Private) => out.push_str("private "),
-            Some(Visibility::Protected) => out.push_str("protected "),
-            Some(Visibility::Public) => out.push_str("public "),
-            None => {}
-        }
-        if base.virtual_base {
-            out.push_str("virtual ");
-        }
-        if let Some(name) = &base.name {
-            out.push_str(name);
-        } else {
-            out.push_str(&type_name(info, typedefs, &base.base_type)?);
-        }
-    }
-    out.push_str(" {\n");
-    if let Some(byte_size) = t.byte_size {
-        writeln!(out, "    // total size: {:#X}", byte_size)?;
-    }
-    let mut vis = match t.kind {
-        StructureKind::Struct => Visibility::Public,
-        StructureKind::Class => Visibility::Private,
-    };
-    let mut indent = 4;
-    let unions = get_anon_unions(info, &t.members)?;
-    let groups = get_anon_union_groups(&t.members, &unions);
-    let mut in_union = 0;
-    let mut in_group = 0;
-    for (i, member) in t.members.iter().enumerate() {
-        if vis != member.visibility {
-            vis = member.visibility;
-            match member.visibility {
-                Visibility::Private => out.push_str("private:\n"),
-                Visibility::Protected => out.push_str("protected:\n"),
-                Visibility::Public => out.push_str("public:\n"),
-            }
-        }
-        for anon in &groups {
-            if i == anon.member_index + anon.member_count {
-                indent -= 4;
-                out.push_str(&indent_all_by(indent, "};\n"));
-                in_group -= 1;
-            }
-        }
-        for anon in &unions {
-            if anon.member_count < 2 {
-                continue;
-            }
-            if i == anon.member_index + anon.member_count {
-                indent -= 4;
-                out.push_str(&indent_all_by(indent, "};\n"));
-                in_union -= 1;
-            }
-        }
-        for anon in &unions {
-            if anon.member_count < 2 {
-                continue;
-            }
-            if i == anon.member_index {
-                out.push_str(&indent_all_by(indent, "union { // inferred\n"));
-                indent += 4;
-                in_union += 1;
-            }
-        }
-        for anon in &groups {
-            if i == anon.member_index {
-                out.push_str(&indent_all_by(indent, "struct { // inferred\n"));
-                indent += 4;
-                in_group += 1;
-            }
-        }
-        let mut var_out = String::new();
-        let ts = type_string(info, typedefs, &member.kind, true)?;
-        if let Some(name) = &member.name {
-            write!(var_out, "{} {}{}", ts.prefix, name, ts.suffix)?;
-        } else {
-            write!(var_out, "{}{}", ts.prefix, ts.suffix)?;
-        }
-        if let Some(bit) = &member.bit {
-            write!(var_out, " : {}", bit.bit_size)?;
-        }
-        let size = if let Some(size) = member.byte_size { size } else { member.kind.size(info)? };
-        writeln!(var_out, "; // offset {:#X}, size {:#X}", member.offset, size)?;
-        out.push_str(&indent_all_by(indent, var_out));
-    }
-    while in_group > 0 {
-        indent -= 4;
-        out.push_str(&indent_all_by(indent, "};\n"));
-        in_group -= 1;
-    }
-    while in_union > 0 {
-        indent -= 4;
-        out.push_str(&indent_all_by(indent, "};\n"));
-        in_union -= 1;
-    }
-    out.push('}');
-    Ok(out)
-}
-
-pub fn enum_def_string(t: &EnumerationType) -> Result<String> {
-    let mut out = match t.name.as_ref() {
-        Some(name) => {
-            if name.starts_with('@') {
-                format!("enum /* {} */ {{\n", name)
-            } else {
-                format!("enum {} {{\n", name)
-            }
-        }
-        None => "enum {\n".to_string(),
-    };
-    for member in t.members.iter() {
-        writeln!(out, "    {} = {},", member.name, member.value)?;
-    }
-    write!(out, "}}")?;
-    Ok(out)
-}
-
-pub fn union_def_string(info: &DwarfInfo, typedefs: &TypedefMap, t: &UnionType) -> Result<String> {
-    let mut out = match t.name.as_ref() {
-        Some(name) => {
-            if name.starts_with('@') {
-                format!("union /* {} */ {{\n", name)
-            } else {
-                format!("union {} {{\n", name)
-            }
-        }
-        None => "union {\n".to_string(),
-    };
-    let mut var_out = String::new();
-    for member in t.members.iter() {
-        let ts = type_string(info, typedefs, &member.kind, true)?;
-        if let Some(name) = &member.name {
-            write!(var_out, "{} {}{};", ts.prefix, name, ts.suffix)?;
-        } else {
-            write!(var_out, "{}{};", ts.prefix, ts.suffix)?;
-        }
-        let size = if let Some(size) = member.byte_size { size } else { member.kind.size(info)? };
-        write!(var_out, " // offset {:#X}, size {:#X}", member.offset, size)?;
-        writeln!(var_out)?;
-    }
-    write!(out, "{}", indent_all_by(4, var_out))?;
-    write!(out, "}}")?;
-    Ok(out)
 }
 
 pub fn process_offset(block: &[u8], e: Endian) -> Result<u32> {
@@ -1828,11 +1120,7 @@ pub const REGISTER_NAMES: [&str; 109] = [
 ];
 
 pub const fn register_name(reg: u32) -> &'static str {
-    if reg < REGISTER_NAMES.len() as u32 {
-        REGISTER_NAMES[reg as usize]
-    } else {
-        "[invalid]"
-    }
+    if reg < REGISTER_NAMES.len() as u32 { REGISTER_NAMES[reg as usize] } else { "[invalid]" }
 }
 
 pub fn process_variable_location(block: &[u8], e: Endian) -> Result<String> {
@@ -1977,29 +1265,65 @@ fn process_structure_tag(info: &DwarfInfo, tag: &Tag) -> Result<StructureType> {
         }
     }
 
+    let mut member_functions = Vec::new();
+    if let Some(member_function_set) = info.member_functions.borrow().get(&tag.key) {
+        for function in member_function_set {
+            let function_tag = match info.tags.get(function) {
+                Some(t) => t,
+                None => return Err(anyhow!("Failed to locate function tag {}", function)),
+            };
+            member_functions.push(process_member_subroutine_def_tag(info, function_tag)?);
+        }
+    }
+
     let mut members = Vec::new();
+    let mut static_members = Vec::new();
     let mut bases = Vec::new();
+    let mut inner_types = Vec::new();
+    let mut typedefs = Vec::new();
     for child in tag.children(&info.tags) {
         match child.kind {
             TagKind::Inheritance => bases.push(process_inheritance_tag(info, child)?),
             TagKind::Member => members.push(process_structure_member_tag(info, child)?),
             TagKind::Typedef => {
-                // TODO?
-                // info!("Structure {:?} Typedef: {:?}", name, child);
+                match info.producer {
+                    Producer::MWCC => {
+                        // TODO handle visibility
+                        // MWCC handles static members as typedefs for whatever reason
+                        static_members.push(process_variable_tag(info, child)?)
+                    }
+                    Producer::GCC => {
+                        // GCC generates a typedef in templated structs with the name of the template
+                        // Let's filter it out to not confuse the user
+                        let td = process_typedef_tag(info, child)?;
+                        let is_template = name
+                            .as_deref()
+                            .is_some_and(|n| n.starts_with(&format!("{}<", td.name)));
+                        if !is_template {
+                            typedefs.push(td);
+                        }
+                    }
+                    _ => {
+                        typedefs.push(process_typedef_tag(info, child)?);
+                    }
+                }
             }
             TagKind::Subroutine | TagKind::GlobalSubroutine => {
                 // TODO
             }
             TagKind::GlobalVariable => {
-                // TODO
+                // TODO handle visibility
+                static_members.push(process_variable_tag(info, child)?)
             }
-            TagKind::StructureType
-            | TagKind::ArrayType
-            | TagKind::EnumerationType
-            | TagKind::UnionType
-            | TagKind::ClassType
-            | TagKind::SubroutineType
-            | TagKind::PtrToMemberType => {
+            TagKind::StructureType | TagKind::ClassType => {
+                inner_types.push(UserDefinedType::Structure(process_structure_tag(info, child)?))
+            }
+            TagKind::EnumerationType => inner_types
+                .push(UserDefinedType::Enumeration(process_enumeration_tag(info, child)?)),
+            TagKind::UnionType => {
+                inner_types.push(UserDefinedType::Union(process_union_tag(info, child)?))
+            }
+            TagKind::ArrayType | TagKind::SubroutineType | TagKind::PtrToMemberType => {
                 // Variable type, ignore
             }
             kind => bail!("Unhandled StructureType child {:?}", kind),
@@ -2014,8 +1338,12 @@ fn process_structure_tag(info: &DwarfInfo, tag: &Tag) -> Result<StructureType> {
         },
         name,
         byte_size,
+        member_functions,
         members,
+        static_members,
         bases,
+        inner_types,
+        typedefs,
     })
 }
 
@@ -2028,15 +1356,18 @@ fn process_array_tag(info: &DwarfInfo, tag: &Tag) -> Result<ArrayType> {
             (AttributeKind::Sibling, _) => {}
             (AttributeKind::SubscrData, AttributeValue::Block(data)) => {
                 subscr_data =
-                    Some(process_array_subscript_data(data, info.e, tag.is_erased).with_context(
-                        || format!("Failed to process SubscrData for tag: {:?}", tag),
-                    )?)
+                    Some(process_array_subscript_data(data, info.e).with_context(|| {
+                        format!("Failed to process SubscrData for tag: {tag:?}")
+                    })?)
             }
             (AttributeKind::Ordering, val) => match val {
                 AttributeValue::Data2(d2) => {
                     let order = ArrayOrdering::try_from_primitive(*d2)?;
                     if order == ArrayOrdering::ColMajor {
-                        log::warn!("Column Major Ordering in Tag {}, Cannot guarantee array will be correct if original source is in different programming language.", tag.key);
+                        log::warn!(
+                            "Column Major Ordering in Tag {}, Cannot guarantee array will be correct if original source is in different programming language.",
+                            tag.key
+                        );
                     }
                 }
                 _ => bail!("Unhandled ArrayType attribute {:?}", attr),
@@ -2056,11 +1387,7 @@ fn process_array_tag(info: &DwarfInfo, tag: &Tag) -> Result<ArrayType> {
     Ok(ArrayType { element_type: Box::from(element_type), dimensions })
 }
 
-fn process_array_subscript_data(
-    data: &[u8],
-    e: Endian,
-    is_erased: bool,
-) -> Result<(Type, Vec<ArrayDimension>)> {
+fn process_array_subscript_data(data: &[u8], e: Endian) -> Result<(Type, Vec<ArrayDimension>)> {
     let mut element_type = None;
     let mut dimensions = Vec::new();
     let mut data = data;
@@ -2101,8 +1428,7 @@ fn process_array_subscript_data(
             SubscriptFormat::ElementType => {
                 let mut cursor = Cursor::new(data);
                 // TODO: is this the right endianness to use for erased tags?
-                let type_attr =
-                    read_attribute(&mut cursor, if is_erased { Endian::Little } else { e }, e)?;
+                let type_attr = read_attribute(&mut cursor, e, e)?;
                 element_type = Some(process_type(&type_attr, e)?);
                 data = &data[cursor.position() as usize..];
             }
@@ -2127,9 +1453,16 @@ fn process_enumeration_tag(info: &DwarfInfo, tag: &Tag) -> Result<EnumerationTyp
             (AttributeKind::ElementList, AttributeValue::Block(data)) => {
                 let mut cursor = Cursor::new(data);
                 while cursor.position() < data.len() as u64 {
-                    let value = i32::from_reader(&mut cursor, info.e)?;
+                    let value = match byte_size {
+                        Some(1) => Some(i8::from_reader(&mut cursor, info.e)? as i32),
+                        Some(2) => Some(i16::from_reader(&mut cursor, info.e)? as i32),
+                        Some(4) => Some(i32::from_reader(&mut cursor, info.e)?),
+                        _ => None,
+                    };
                     let name = read_string(&mut cursor)?;
-                    members.push(EnumerationMember { name, value });
+                    if let Some(value) = value {
+                        members.push(EnumerationMember { name, value });
+                    }
                 }
             }
             (AttributeKind::Member, &AttributeValue::Reference(_key)) => {
@@ -2147,6 +1480,12 @@ fn process_enumeration_tag(info: &DwarfInfo, tag: &Tag) -> Result<EnumerationTyp
 
     let byte_size =
         byte_size.ok_or_else(|| anyhow!("EnumerationType without ByteSize: {:?}", tag))?;
+
+    if info.producer == Producer::GCC {
+        // for some reason enum members are reversed in GCC
+        members.reverse();
+    }
+
     Ok(EnumerationType { name, byte_size, members })
 }
 
@@ -2191,6 +1530,257 @@ fn process_union_tag(info: &DwarfInfo, tag: &Tag) -> Result<UnionType> {
     Ok(UnionType { name, byte_size, members })
 }
 
+// for member functions
+fn preprocess_subroutine_tag(info: &DwarfInfo, tag: &Tag) -> Result<()> {
+    ensure!(
+        matches!(
+            tag.kind,
+            TagKind::SubroutineType
+                | TagKind::GlobalSubroutine
+                | TagKind::Subroutine
+                | TagKind::InlinedSubroutine
+        ),
+        "{:?} is not a Subroutine tag",
+        tag.kind
+    );
+
+    let mut append_to = None;
+    for child in tag.children(&info.tags) {
+        if child.kind == TagKind::FormalParameter {
+            let param = process_subroutine_parameter_tag(info, child)?;
+            if param.name.as_deref() == Some("this") {
+                if let TypeKind::UserDefined(key) = param.kind.kind {
+                    append_to = Some(key);
+                    break;
+                }
+            }
+        }
+    }
+    // On GCC we can detect static methods because there namespaces aren't retained
+    if info.producer == Producer::GCC && append_to.is_none() {
+        for attr in &tag.attributes {
+            if let (AttributeKind::Member, &AttributeValue::Reference(key)) =
+                (attr.kind, &attr.value)
+            {
+                append_to = Some(key);
+                break;
+            }
+        }
+    }
+
+    if let Some(key) = append_to {
+        match info.member_functions.borrow_mut().entry(key) {
+            btree_map::Entry::Vacant(e) => {
+                let mut set = BTreeSet::new();
+                set.insert(tag.key);
+                e.insert(set);
+            }
+            btree_map::Entry::Occupied(e) => {
+                e.into_mut().insert(tag.key);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn process_member_subroutine_def_tag(
+    info: &DwarfInfo,
+    tag: &Tag,
+) -> Result<MemberSubroutineDefType> {
+    ensure!(
+        matches!(
+            tag.kind,
+            TagKind::SubroutineType
+                | TagKind::GlobalSubroutine
+                | TagKind::Subroutine
+                | TagKind::InlinedSubroutine
+        ),
+        "{:?} is not a Subroutine tag",
+        tag.kind
+    );
+
+    let mut name = None;
+    let mut mangled_name = None;
+    let mut return_type = None;
+    let mut prototyped = false;
+    let mut parameters = Vec::new();
+    let mut var_args = false;
+    let mut member_of = None;
+    let mut inline = false;
+    let mut start_address = None;
+    let mut end_address = None;
+    let mut virtual_ = false;
+    // as opposed to a higher base class whose function is beging overridden
+    let mut this_pointer_found = false;
+    let mut direct_base_key = None;
+    let mut const_ = false;
+    let mut volatile_ = false;
+    for attr in &tag.attributes {
+        match (attr.kind, &attr.value) {
+            (AttributeKind::Sibling, _) => {}
+            (AttributeKind::Name, AttributeValue::String(s)) => name = Some(s.clone()),
+            (AttributeKind::MwMangled, AttributeValue::String(s)) => mangled_name = Some(s.clone()),
+            (
+                AttributeKind::FundType
+                | AttributeKind::ModFundType
+                | AttributeKind::UserDefType
+                | AttributeKind::ModUDType,
+                _,
+            ) => return_type = Some(process_type(attr, info.e)?),
+            (AttributeKind::Prototyped, _) => prototyped = true,
+            (AttributeKind::LowPc, &AttributeValue::Address(addr)) => {
+                start_address = Some(addr);
+            }
+            (AttributeKind::HighPc, &AttributeValue::Address(addr)) => {
+                end_address = Some(addr);
+            }
+            (AttributeKind::MwGlobalRef, &AttributeValue::Reference(_)) => {}
+            (AttributeKind::MwGlobalRefsBlock, AttributeValue::Block(_)) => {
+                // Global references block
+            }
+            (AttributeKind::ReturnAddr, AttributeValue::Block(_block)) => {}
+            (AttributeKind::Member, &AttributeValue::Reference(key)) => {
+                member_of = Some(key);
+            }
+            (AttributeKind::MwPrologueEnd, &AttributeValue::Address(_addr)) => {
+                // Prologue end
+            }
+            (AttributeKind::MwEpilogueStart, &AttributeValue::Address(_addr)) => {
+                // Epilogue start
+            }
+            (
+                AttributeKind::MwRestoreSp
+                | AttributeKind::MwRestoreS0
+                | AttributeKind::MwRestoreS1
+                | AttributeKind::MwRestoreS2
+                | AttributeKind::MwRestoreS3
+                | AttributeKind::MwRestoreS4
+                | AttributeKind::MwRestoreS5
+                | AttributeKind::MwRestoreS6
+                | AttributeKind::MwRestoreS7
+                | AttributeKind::MwRestoreS8
+                | AttributeKind::MwRestoreF20
+                | AttributeKind::MwRestoreF21
+                | AttributeKind::MwRestoreF22
+                | AttributeKind::MwRestoreF23
+                | AttributeKind::MwRestoreF24
+                | AttributeKind::MwRestoreF25
+                | AttributeKind::MwRestoreF26
+                | AttributeKind::MwRestoreF27
+                | AttributeKind::MwRestoreF28
+                | AttributeKind::MwRestoreF29
+                | AttributeKind::MwRestoreF30,
+                AttributeValue::Block(_),
+            ) => {
+                // Restore register
+            }
+            (AttributeKind::Inline, _) => inline = true,
+            (AttributeKind::Virtual, _) => virtual_ = true,
+            (AttributeKind::Specification, &AttributeValue::Reference(key)) => {
+                let spec_tag = info
+                    .tags
+                    .get(&key)
+                    .ok_or_else(|| anyhow!("Failed to locate specification tag {}", key))?;
+                // Merge attributes from specification tag
+                let spec = process_subroutine_tag(info, spec_tag)?;
+                name = name.or(spec.name);
+                mangled_name = mangled_name.or(spec.mangled_name);
+                return_type = return_type.or(Some(spec.return_type));
+                prototyped = prototyped || spec.prototyped;
+                parameters.extend(spec.parameters);
+                var_args = var_args || spec.var_args;
+                member_of = member_of.or(spec.member_of);
+                inline = inline || spec.inline;
+                virtual_ = virtual_ || spec.virtual_;
+            }
+            _ => {
+                bail!("Unhandled SubroutineType attribute {:?}", attr);
+            }
+        }
+    }
+
+    for child in tag.children(&info.tags) {
+        match child.kind {
+            TagKind::FormalParameter => {
+                let param = process_subroutine_parameter_tag(info, child)?;
+                if !this_pointer_found && param.name.as_deref() == Some("this") {
+                    let modifiers = &param.kind.modifiers;
+                    if modifiers.len() >= 3
+                        && modifiers[0] == Modifier::Const
+                        && modifiers[2] == Modifier::Const
+                    {
+                        const_ = true;
+                    }
+                    if modifiers.contains(&Modifier::Volatile) {
+                        volatile_ = true;
+                    }
+                    // This is needed because direct_base differs from member_of in virtual function overrides
+                    if let TypeKind::UserDefined(key) = param.kind.kind {
+                        direct_base_key = Some(key);
+                    }
+                    this_pointer_found = true;
+                }
+                // Avoid applying ones that were already in the specification
+                if !parameters.iter().any(|p| {
+                    matches!(
+                        (p.name.as_ref(), param.name.as_ref()),
+                        (Some(a), Some(b)) if a == b
+                    )
+                }) {
+                    parameters.push(param);
+                }
+            }
+            TagKind::UnspecifiedParameters
+            | TagKind::LocalVariable
+            | TagKind::GlobalVariable
+            | TagKind::Label
+            | TagKind::LexicalBlock
+            | TagKind::InlinedSubroutine
+            | TagKind::StructureType
+            | TagKind::EnumerationType
+            | TagKind::UnionType
+            | TagKind::Typedef
+            | TagKind::ArrayType
+            | TagKind::SubroutineType
+            | TagKind::PtrToMemberType => {}
+            kind => bail!("Unhandled SubroutineType child {:?}", kind),
+        }
+    }
+
+    let return_type = return_type
+        .unwrap_or_else(|| Type { kind: TypeKind::Fundamental(FundType::Void), modifiers: vec![] });
+    let direct_member_of = direct_base_key;
+    let local = tag.kind == TagKind::Subroutine;
+
+    let mut static_member = false;
+    if let Producer::GCC = info.producer {
+        // GCC doesn't retain namespaces, so this is a nice way to determine staticness
+        static_member = member_of.is_some() && !this_pointer_found;
+    }
+    let override_ = virtual_ && member_of != direct_member_of;
+    let subroutine = MemberSubroutineDefType {
+        name,
+        mangled_name,
+        return_type,
+        parameters,
+        var_args,
+        prototyped,
+        member_of,
+        direct_member_of,
+        inline,
+        virtual_,
+        local,
+        start_address,
+        end_address,
+        const_,
+        static_member,
+        override_,
+        volatile_,
+    };
+    Ok(subroutine)
+}
+
 fn process_subroutine_tag(info: &DwarfInfo, tag: &Tag) -> Result<SubroutineType> {
     ensure!(
         matches!(
@@ -2216,6 +1806,11 @@ fn process_subroutine_tag(info: &DwarfInfo, tag: &Tag) -> Result<SubroutineType>
     let mut start_address = None;
     let mut end_address = None;
     let mut virtual_ = false;
+    // as opposed to a higher base class whose function is beging overridden
+    let mut this_pointer_found = false;
+    let mut direct_base_key = None;
+    let mut const_ = false;
+    let mut volatile_ = false;
     for attr in &tag.attributes {
         match (attr.kind, &attr.value) {
             (AttributeKind::Sibling, _) => {}
@@ -2308,12 +1903,39 @@ fn process_subroutine_tag(info: &DwarfInfo, tag: &Tag) -> Result<SubroutineType>
 
     let mut variables = Vec::new();
     let mut labels = Vec::new();
-    let mut blocks = Vec::new();
-    let mut inlines = Vec::new();
+    let mut blocks_and_inlines = Vec::new();
+    let mut inner_types = Vec::new();
+    let mut typedefs = Vec::new();
     for child in tag.children(&info.tags) {
         match child.kind {
             TagKind::FormalParameter => {
-                parameters.push(process_subroutine_parameter_tag(info, child)?)
+                let param = process_subroutine_parameter_tag(info, child)?;
+                if !this_pointer_found && param.name.as_deref() == Some("this") {
+                    let modifiers = &param.kind.modifiers;
+                    if modifiers.len() >= 3
+                        && modifiers[0] == Modifier::Const
+                        && modifiers[2] == Modifier::Const
+                    {
+                        const_ = true;
+                    }
+                    if modifiers.contains(&Modifier::Volatile) {
+                        volatile_ = true;
+                    }
+                    // This is needed because direct_base differs from member_of in virtual function overrides
+                    if let TypeKind::UserDefined(key) = param.kind.kind {
+                        direct_base_key = Some(key);
+                    }
+                    this_pointer_found = true;
+                }
+                // Avoid applying ones that were already in the specification
+                if !parameters.iter().any(|p| {
+                    matches!(
+                        (p.name.as_ref(), param.name.as_ref()),
+                        (Some(a), Some(b)) if a == b
+                    )
+                }) {
+                    parameters.push(param);
+                }
             }
             TagKind::UnspecifiedParameters => var_args = true,
             TagKind::LocalVariable => variables.push(process_local_variable_tag(info, child)?),
@@ -2323,18 +1945,21 @@ fn process_subroutine_tag(info: &DwarfInfo, tag: &Tag) -> Result<SubroutineType>
             TagKind::Label => labels.push(process_subroutine_label_tag(info, child)?),
             TagKind::LexicalBlock => {
                 if let Some(block) = process_subroutine_block_tag(info, child)? {
-                    blocks.push(block);
+                    blocks_and_inlines.push(SubroutineNode::Block(block));
                 }
             }
-            TagKind::InlinedSubroutine => inlines.push(process_subroutine_tag(info, child)?),
-            TagKind::StructureType
-            | TagKind::ArrayType
-            | TagKind::EnumerationType
-            | TagKind::UnionType
-            | TagKind::ClassType
-            | TagKind::SubroutineType
-            | TagKind::PtrToMemberType
-            | TagKind::Typedef => {
+            TagKind::InlinedSubroutine => blocks_and_inlines
+                .push(SubroutineNode::Inline(process_subroutine_tag(info, child)?)),
+            TagKind::StructureType | TagKind::ClassType => {
+                inner_types.push(UserDefinedType::Structure(process_structure_tag(info, child)?))
+            }
+            TagKind::EnumerationType => inner_types
+                .push(UserDefinedType::Enumeration(process_enumeration_tag(info, child)?)),
+            TagKind::UnionType => {
+                inner_types.push(UserDefinedType::Union(process_union_tag(info, child)?))
+            }
+            TagKind::Typedef => typedefs.push(process_typedef_tag(info, child)?),
+            TagKind::ArrayType | TagKind::SubroutineType | TagKind::PtrToMemberType => {
                 // Variable type, ignore
             }
             kind => bail!("Unhandled SubroutineType child {:?}", kind),
@@ -2343,8 +1968,16 @@ fn process_subroutine_tag(info: &DwarfInfo, tag: &Tag) -> Result<SubroutineType>
 
     let return_type = return_type
         .unwrap_or_else(|| Type { kind: TypeKind::Fundamental(FundType::Void), modifiers: vec![] });
+    let direct_member_of = direct_base_key;
     let local = tag.kind == TagKind::Subroutine;
-    Ok(SubroutineType {
+
+    let mut static_member = false;
+    if let Producer::GCC = info.producer {
+        // GCC doesn't retain namespaces, so this is a nice way to determine staticness
+        static_member = member_of.is_some() && !this_pointer_found;
+    }
+    let override_ = virtual_ && member_of != direct_member_of;
+    let subroutine = SubroutineType {
         name,
         mangled_name,
         return_type,
@@ -2353,16 +1986,23 @@ fn process_subroutine_tag(info: &DwarfInfo, tag: &Tag) -> Result<SubroutineType>
         prototyped,
         references,
         member_of,
+        direct_member_of,
         variables,
         inline,
         virtual_,
         local,
         labels,
-        blocks,
-        inlines,
+        blocks_and_inlines,
+        inner_types,
+        typedefs,
         start_address,
         end_address,
-    })
+        const_,
+        static_member,
+        override_,
+        volatile_,
+    };
+    Ok(subroutine)
 }
 
 fn process_subroutine_label_tag(info: &DwarfInfo, tag: &Tag) -> Result<SubroutineLabel> {
@@ -2405,8 +2045,9 @@ fn process_subroutine_block_tag(info: &DwarfInfo, tag: &Tag) -> Result<Option<Su
     }
 
     let mut variables = Vec::new();
-    let mut blocks = Vec::new();
-    let mut inlines = Vec::new();
+    let mut blocks_and_inlines = Vec::new();
+    let mut inner_types = Vec::new();
+    let mut typedefs = Vec::new();
     for child in tag.children(&info.tags) {
         match child.kind {
             TagKind::LocalVariable => variables.push(process_local_variable_tag(info, child)?),
@@ -2415,26 +2056,42 @@ fn process_subroutine_block_tag(info: &DwarfInfo, tag: &Tag) -> Result<Option<Su
             }
             TagKind::LexicalBlock => {
                 if let Some(block) = process_subroutine_block_tag(info, child)? {
-                    blocks.push(block);
+                    blocks_and_inlines.push(SubroutineNode::Block(block));
                 }
             }
             TagKind::InlinedSubroutine => {
-                inlines.push(process_subroutine_tag(info, child)?);
+                blocks_and_inlines
+                    .push(SubroutineNode::Inline(process_subroutine_tag(info, child)?));
             }
-            TagKind::StructureType
-            | TagKind::ArrayType
-            | TagKind::EnumerationType
-            | TagKind::UnionType
-            | TagKind::ClassType
-            | TagKind::SubroutineType
-            | TagKind::PtrToMemberType => {
+            TagKind::StructureType | TagKind::ClassType => {
+                inner_types.push(UserDefinedType::Structure(process_structure_tag(info, child)?))
+            }
+            TagKind::EnumerationType => {
+                inner_types
+                    .push(UserDefinedType::Enumeration(process_enumeration_tag(info, child)?));
+            }
+            TagKind::UnionType => {
+                inner_types.push(UserDefinedType::Union(process_union_tag(info, child)?))
+            }
+            TagKind::Typedef => {
+                typedefs.push(process_typedef_tag(info, child)?);
+            }
+            TagKind::ArrayType | TagKind::SubroutineType | TagKind::PtrToMemberType => {
                 // Variable type, ignore
             }
             kind => bail!("Unhandled LexicalBlock child {:?}", kind),
         }
     }
 
-    Ok(Some(SubroutineBlock { name, start_address, end_address, variables, blocks, inlines }))
+    Ok(Some(SubroutineBlock {
+        name,
+        start_address,
+        end_address,
+        variables,
+        blocks_and_inlines,
+        inner_types,
+        typedefs,
+    }))
 }
 
 fn process_subroutine_parameter_tag(info: &DwarfInfo, tag: &Tag) -> Result<SubroutineParameter> {
@@ -2456,10 +2113,7 @@ fn process_subroutine_parameter_tag(info: &DwarfInfo, tag: &Tag) -> Result<Subro
             ) => kind = Some(process_type(attr, info.e)?),
             (AttributeKind::Location, AttributeValue::Block(block)) => {
                 if !block.is_empty() {
-                    location = Some(process_variable_location(
-                        block,
-                        if tag.is_erased { Endian::Little } else { info.e },
-                    )?);
+                    location = Some(process_variable_location(block, tag.data_endian)?);
                 }
             }
             (AttributeKind::MwDwarf2Location, AttributeValue::Block(_block)) => {
@@ -2514,10 +2168,7 @@ fn process_local_variable_tag(info: &DwarfInfo, tag: &Tag) -> Result<SubroutineV
             ) => kind = Some(process_type(attr, info.e)?),
             (AttributeKind::Location, AttributeValue::Block(block)) => {
                 if !block.is_empty() {
-                    location = Some(process_variable_location(
-                        block,
-                        if tag.is_erased { Endian::Little } else { info.e },
-                    )?);
+                    location = Some(process_variable_location(block, tag.data_endian)?);
                 }
             }
             (AttributeKind::MwDwarf2Location, AttributeValue::Block(_block)) => {
@@ -2583,6 +2234,15 @@ fn process_ptr_to_member_tag(info: &DwarfInfo, tag: &Tag) -> Result<PtrToMemberT
     Ok(PtrToMemberType { kind, containing_type })
 }
 
+pub fn get_udt_by_key(info: &DwarfInfo, key: u32) -> Result<UserDefinedType> {
+    let tag = match info.tags.get(&key) {
+        Some(t) => t,
+        None => return Err(anyhow!("Failed to locate user defined type {}", key)),
+    };
+
+    ud_type(info, tag)
+}
+
 pub fn ud_type(info: &DwarfInfo, tag: &Tag) -> Result<UserDefinedType> {
     match tag.kind {
         TagKind::ArrayType => Ok(UserDefinedType::Array(process_array_tag(info, tag)?)),
@@ -2615,13 +2275,13 @@ pub fn process_type(attr: &Attribute, e: Endian) -> Result<Type> {
     match (attr.kind, &attr.value) {
         (AttributeKind::FundType, &AttributeValue::Data2(type_id)) => {
             let fund_type = FundType::parse_int(type_id)
-                .with_context(|| format!("Invalid fundamental type ID '{:04X}'", type_id))?;
+                .with_context(|| format!("Invalid fundamental type ID '{type_id:04X}'"))?;
             Ok(Type { kind: TypeKind::Fundamental(fund_type), modifiers: vec![] })
         }
         (AttributeKind::ModFundType, AttributeValue::Block(ops)) => {
             let type_id = u16::from_bytes(ops[ops.len() - 2..].try_into()?, e);
             let fund_type = FundType::parse_int(type_id)
-                .with_context(|| format!("Invalid fundamental type ID '{:04X}'", type_id))?;
+                .with_context(|| format!("Invalid fundamental type ID '{type_id:04X}'"))?;
             let modifiers = process_modifiers(&ops[..ops.len() - 2])?;
             Ok(Type { kind: TypeKind::Fundamental(fund_type), modifiers })
         }
@@ -2720,6 +2380,15 @@ pub fn process_overlay_branch(tag: &Tag) -> Result<OverlayBranch> {
     Ok(OverlayBranch { name, id, start_address, end_address, compile_unit })
 }
 
+pub fn preprocess_cu_tag(info: &DwarfInfo, tag: &Tag) {
+    match tag.kind {
+        TagKind::SubroutineType | TagKind::GlobalSubroutine | TagKind::Subroutine => {
+            let _ = preprocess_subroutine_tag(info, tag);
+        }
+        _ => {}
+    }
+}
+
 pub fn process_cu_tag(info: &DwarfInfo, tag: &Tag) -> Result<TagType> {
     match tag.kind {
         TagKind::Typedef => Ok(TagType::Typedef(process_typedef_tag(info, tag)?)),
@@ -2734,7 +2403,7 @@ pub fn process_cu_tag(info: &DwarfInfo, tag: &Tag) -> Result<TagType> {
         | TagKind::SubroutineType
         | TagKind::GlobalSubroutine
         | TagKind::Subroutine
-        | TagKind::PtrToMemberType => Ok(TagType::UserDefined(ud_type(info, tag)?)),
+        | TagKind::PtrToMemberType => Ok(TagType::UserDefined(Box::new(ud_type(info, tag)?))),
         kind => Err(anyhow!("Unhandled root tag type {:?}", kind)),
     }
 }
@@ -2746,55 +2415,6 @@ pub fn should_skip_tag(tag_type: &TagType, is_erased: bool) -> bool {
         TagType::Typedef(_) => false,
         TagType::UserDefined(t) => !t.is_definition(),
     }
-}
-
-pub fn tag_type_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    tag_type: &TagType,
-    is_erased: bool,
-) -> Result<String> {
-    match tag_type {
-        TagType::Typedef(t) => typedef_string(info, typedefs, t),
-        TagType::Variable(v) => variable_string(info, typedefs, v, true),
-        TagType::UserDefined(ud) => {
-            let ud_str = ud_type_def(info, typedefs, ud, is_erased)?;
-            match ud {
-                UserDefinedType::Structure(_)
-                | UserDefinedType::Enumeration(_)
-                | UserDefinedType::Union(_) => Ok(format!("{};", ud_str)),
-                _ => Ok(ud_str),
-            }
-        }
-    }
-}
-
-fn typedef_string(info: &DwarfInfo, typedefs: &TypedefMap, typedef: &TypedefTag) -> Result<String> {
-    let ts = type_string(info, typedefs, &typedef.kind, true)?;
-    Ok(format!("typedef {} {}{};", ts.prefix, typedef.name, ts.suffix))
-}
-
-fn variable_string(
-    info: &DwarfInfo,
-    typedefs: &TypedefMap,
-    variable: &VariableTag,
-    include_extra: bool,
-) -> Result<String> {
-    let ts = type_string(info, typedefs, &variable.kind, include_extra)?;
-    let mut out = if variable.local { "static ".to_string() } else { String::new() };
-    out.push_str(&ts.prefix);
-    out.push(' ');
-    out.push_str(variable.name.as_deref().unwrap_or("[unknown]"));
-    out.push_str(&ts.suffix);
-    out.push(';');
-    if include_extra {
-        let size = variable.kind.size(info)?;
-        out.push_str(&format!(" // size: {:#X}", size));
-        if let Some(addr) = variable.address {
-            out.push_str(&format!(", address: {:#X}", addr));
-        }
-    }
-    Ok(out)
 }
 
 fn process_typedef_tag(info: &DwarfInfo, tag: &Tag) -> Result<TypedefTag> {
@@ -2813,6 +2433,19 @@ fn process_typedef_tag(info: &DwarfInfo, tag: &Tag) -> Result<TypedefTag> {
                 | AttributeKind::ModUDType,
                 _,
             ) => kind = Some(process_type(attr, info.e)?),
+            (AttributeKind::Member, _) => {
+                // can be ignored for now
+            }
+            (AttributeKind::Specification, &AttributeValue::Reference(key)) => {
+                let spec_tag = info
+                    .tags
+                    .get(&key)
+                    .ok_or_else(|| anyhow!("Failed to locate specification tag {}", key))?;
+                // Merge attributes from specification tag
+                let spec = process_typedef_tag(info, spec_tag)?;
+                name = name.or(Some(spec.name));
+                kind = kind.or(Some(spec.kind));
+            }
             _ => {
                 bail!("Unhandled Typedef attribute {:?}", attr);
             }
@@ -2828,12 +2461,14 @@ fn process_typedef_tag(info: &DwarfInfo, tag: &Tag) -> Result<TypedefTag> {
     Ok(TypedefTag { name, kind })
 }
 
-fn process_variable_tag(info: &DwarfInfo, tag: &Tag) -> Result<VariableTag> {
-    ensure!(
-        matches!(tag.kind, TagKind::GlobalVariable | TagKind::LocalVariable),
-        "{:?} is not a variable tag",
-        tag.kind
-    );
+pub fn process_variable_tag(info: &DwarfInfo, tag: &Tag) -> Result<VariableTag> {
+    let is_variable = match tag.kind {
+        TagKind::GlobalVariable | TagKind::LocalVariable => true,
+        TagKind::Typedef if info.producer == Producer::MWCC => true,
+        _ => false,
+    };
+
+    ensure!(is_variable, "{:?} is not a variable tag", tag.kind);
 
     let mut name = None;
     let mut mangled_name = None;

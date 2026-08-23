@@ -3,7 +3,7 @@ use std::{
     mem::take,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use cwextab::decode_extab;
 use ppc750cl::Opcode;
 use tracing::{debug_span, info_span};
@@ -11,16 +11,17 @@ use tracing_attributes::instrument;
 
 use crate::{
     analysis::{
+        RelocationTarget,
         cfa::SectionAddress,
         executor::{ExecCbData, ExecCbResult, Executor},
         relocation_target_for, uniq_jump_table_entries,
-        vm::{is_store_op, BranchTarget, GprValue, StepResult, VM},
-        RelocationTarget,
+        vm::{BranchTarget, GprValue, StepResult, VM, is_store_op},
     },
     obj::{
         ObjDataKind, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSection, ObjSectionKind,
         ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, SectionIndex, SymbolIndex,
     },
+    util::config::{create_auto_symbol_name, is_auto_symbol},
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -417,9 +418,13 @@ impl Tracker {
                 Ok(ExecCbResult::Continue)
             }
             StepResult::Jump(target) => match target {
+                BranchTarget::Return => Ok(ExecCbResult::EndBlock),
                 BranchTarget::Unknown
-                | BranchTarget::Return
                 | BranchTarget::JumpTable { address: RelocationTarget::External, .. } => {
+                    let next_addr = ins_addr + 4;
+                    if next_addr < function_end {
+                        possible_missed_branches.insert(ins_addr + 4, vm.clone_all());
+                    }
                     Ok(ExecCbResult::EndBlock)
                 }
                 BranchTarget::Address(addr) => {
@@ -576,7 +581,7 @@ impl Tracker {
             let relocation_target = relocation_target_for(obj, from, None).ok().flatten();
             if !matches!(relocation_target, None | Some(RelocationTarget::External)) {
                 // VM should have already handled this
-                panic!("Relocation already exists for {:#010X} (from {:#010X})", addr, from);
+                panic!("Relocation already exists for {addr:#010X} (from {from:#010X})");
             }
         }
         // Remainder of this function is for executable objects only
@@ -668,7 +673,7 @@ impl Tracker {
                 0
             };
             let new_name =
-                if module_id == 0 { name.to_string() } else { format!("{}:{}", name, module_id) };
+                if module_id == 0 { name.to_string() } else { format!("{name}:{module_id}") };
             log::debug!("Renaming {} to {}", section.name, new_name);
             section.name = new_name;
         }
@@ -818,6 +823,23 @@ impl Tracker {
                 }
             }
         }
+
+        // Rename all discovered extab dtors from extab relocations
+        if let Some((_, extab_section)) = obj.sections.by_name("extab")? {
+            for (_, reloc) in extab_section.relocations.iter() {
+                let symbol = &obj.symbols[reloc.target_symbol];
+                // Only rename auto symbols
+                if is_auto_symbol(symbol) {
+                    let mut new_symbol = symbol.clone();
+                    let name =
+                        create_auto_symbol_name("dtor", obj.module_id, symbol.address as u32);
+
+                    new_symbol.name = name;
+                    obj.symbols.replace(reloc.target_symbol, new_symbol)?;
+                }
+            }
+        }
+
         Ok(())
     }
 }

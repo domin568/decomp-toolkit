@@ -3,13 +3,13 @@ use std::{
     io::{Read, Seek, Write},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use tracing::warn;
 
 use crate::{
     obj::{ObjSymbol, ObjSymbolKind},
-    util::reader::{skip_bytes, struct_size, Endian, FromReader, ToWriter},
+    util::reader::{Endian, FromReader, ToWriter, skip_bytes, struct_size},
 };
 
 #[derive(Debug, Copy, Clone, IntoPrimitive, TryFromPrimitive)]
@@ -58,7 +58,7 @@ impl FromReader for MWComment {
         if magic != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Invalid .comment section magic: {:?}", magic),
+                format!("Invalid .comment section magic: {magic:?}"),
             ));
         }
         // 0xB
@@ -78,8 +78,8 @@ impl FromReader for MWComment {
             value => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Invalid value for pool_data: {}", value),
-                ))
+                    format!("Invalid value for pool_data: {value}"),
+                ));
             }
         };
         // 0x11
@@ -93,8 +93,8 @@ impl FromReader for MWComment {
             v => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Expected header size {:#X}, got {:#X}", HEADER_SIZE, v),
-                ))
+                    format!("Expected header size {HEADER_SIZE:#X}, got {v:#X}"),
+                ));
             }
         }
         // 0x15
@@ -102,7 +102,7 @@ impl FromReader for MWComment {
         if flags & !7 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Unexpected flag value {:#X}", flags),
+                format!("Unexpected flag value {flags:#X}"),
             ));
         }
         if flags & 1 == 1 {
@@ -221,14 +221,14 @@ impl FromReader for CommentSym {
         if value != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Unexpected value after active_flags (1): {:#X}", value),
+                format!("Unexpected value after active_flags (1): {value:#X}"),
             ));
         }
         let value = u8::from_reader(reader, e)?;
         if value != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Unexpected value after active_flags (2): {:#X}", value),
+                format!("Unexpected value after active_flags (2): {value:#X}"),
             ));
         }
         Ok(out)
