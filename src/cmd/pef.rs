@@ -47,12 +47,7 @@ fn info(args: InfoArgs) -> Result<()> {
     //FindSaveRestSleds::execute(&mut state, &obj)?;
     state.detect_functions(&obj)?;
     state.apply(&mut obj)?;
-    for (addr, _) in state.functions.iter()
-    {
-        log::debug!(
-            "{:#010X}", addr.address, 
-        );
-    }
+
     log::debug!(
         "Discovered {} functions",
         state.functions.iter().filter(|(_, i)| i.end.is_some()).count()
