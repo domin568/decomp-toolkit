@@ -17,7 +17,7 @@ use crate::{
         ObjSymbolKind, SectionIndex,
     },
     util::config::create_auto_symbol_name,
-    util::tbtab::{ TracebackTable },
+    util::pef_tbtab::{ TracebackTable },
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -113,10 +113,6 @@ impl FunctionInfo {
 
     pub fn is_unfinalized(&self) -> bool {
         self.analyzed && self.end.is_none() && self.slices.is_some()
-    }
-
-    pub fn has_traceback_table(&self) -> bool {
-        self.tbtab.is_some()
     }
 }
 
@@ -486,7 +482,6 @@ impl AnalyzerState {
 
     fn detect_new_functions(&mut self, obj: &ObjInfo) -> Result<bool> {
         let mut new_functions = Vec::new();
-        // Traceback tables discovered for existing functions
         let mut found_tbtabs: Vec<(SectionAddress, TracebackTable)> = Vec::new();
         for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
             let section_start = SectionAddress::new(section_index, section.address as u32);

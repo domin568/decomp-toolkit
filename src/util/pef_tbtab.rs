@@ -1,8 +1,9 @@
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, Result};
 
 use std::io::{ Cursor, Read };
 use byteorder::{BigEndian, ReadBytesExt};
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum Language {
     C = 0,
@@ -42,12 +43,14 @@ impl std::convert::TryFrom<u8> for Language {
     }
 }
 
+#[allow(dead_code)]
 pub enum OnConditionDirective {
     WalkOnCond	= 0,	/* Walk the stack without restoring state */
     DiscardOnCond = 1,	/* Walk the stack and discard */
     InvokeOnCond =	2,	/* Invoke a specific system routine */
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TracebackTableShort {
     reserved:                  i32, // always 0
@@ -61,6 +64,7 @@ pub struct TracebackTableShort {
     flags5:                    u8,
 }
 
+#[allow(dead_code)]
 impl TracebackTableShort {
     // flags1
     const GLOBAL_LINKAGE:              u8 = 0b1000_0000; // Set if routine is global linkage
@@ -160,6 +164,7 @@ impl TracebackTableShort {
 
 /// more info at retro68/gcc/gcc/config/rs6000/rs6000-logue.cc
 /// also debug.h in AIX 4+ OS src code
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TracebackTable {
     pub short:                     TracebackTableShort,
@@ -194,11 +199,11 @@ impl TracebackTable {
             .then(|| ext_tb_cur.read_u32::<BigEndian>().ok())
             .flatten();
 
-        let mut fnc_size_= (short_tb.has_traceback_table_offset())
+        let fnc_size_ = (short_tb.has_traceback_table_offset())
             .then(|| ext_tb_cur.read_u32::<BigEndian>().ok())
             .flatten();
 
-        let mut hand_mask_= (short_tb.is_interupt_handler())
+        let hand_mask_ = (short_tb.is_interupt_handler())
             .then(|| ext_tb_cur.read_i32::<BigEndian>().ok())
             .flatten();
 

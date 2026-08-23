@@ -6,6 +6,7 @@ use typed_path::Utf8NativePathBuf;
 use crate::util::config::is_auto_symbol;
 use crate::util::{path::native_path, IntoCow, ToCow, pef::process_pef};
 use crate::analysis::cfa::AnalyzerState;
+use cwdemangle;
 
 #[derive(FromArgs, PartialEq, Debug)]
 /// Commands for processing PEF files.
@@ -65,6 +66,7 @@ fn info(args: InfoArgs) -> Result<()> {
             section.name, section.address, section.size, section.file_offset
         );
     }
+
     println!("\nDiscovered symbols:");
     println!("\t{: >10} | {: <10} | {: <10} | {: <10}", "Section", "Address", "Size", "Name");
     for (_, symbol) in obj.symbols.iter_ordered().chain(obj.symbols.iter_abs()) {
@@ -83,11 +85,18 @@ fn info(args: InfoArgs) -> Result<()> {
         } else {
             "?".to_cow()
         };
+
+        cwdemangle::demangle(symbol.name.as_str(), &cwdemangle::DemangleOptions{ omit_empty_parameters: true, mw_extensions: true }).map(|demangled| {
+            println!(
+                "\t{: >10} | {: <#10X} | {: <10} | {: <10}",
+                section_str, symbol.address, size_str, demangled
+            );
+        }).unwrap_or_else(|| {
         println!(
             "\t{: >10} | {: <#10X} | {: <10} | {: <10}",
             section_str, symbol.address, size_str, symbol.name
         );
-    }
+        })};
     println!("\n{} discovered functions from exception table", obj.known_functions.len());
     Ok(())
 }
