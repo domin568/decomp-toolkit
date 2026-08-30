@@ -324,3 +324,75 @@ impl TracebackTable {
         (TracebackTableShort::size() + self.ext_size + 3) & !3 // 4 byte aligned
     }
 }
+
+impl TracebackTable {
+    /// The names of every flag that is set, for display.
+    pub fn flags(&self) -> Vec<&'static str> {
+        let s = &self.short;
+        [
+            (s.is_global_linkage(), "global linkage"),
+            (s.is_out_of_line_prolog_epilog(), "out-of-line prolog/epilog"),
+            (s.has_traceback_table_offset(), "has table offset"),
+            (s.is_internal_procedure(), "internal procedure"),
+            (s.has_controlled_storage(), "controlled storage"),
+            (s.is_tocless(), "tocless"),
+            (s.is_floating_point_present(), "floating point"),
+            (s.log_abort_fp(), "logs/aborts FP"),
+            (s.is_interupt_handler(), "interrupt handler"),
+            (s.name_present(), "named"),
+            (s.uses_alloca(), "uses alloca"),
+            (s.cr_saved(), "saves CR"),
+            (s.lr_saved(), "saves LR"),
+            (s.stores_bc(), "stores backchain"),
+            (s.is_fixup(), "fixup code"),
+            (s.has_ext_table(), "has extension table"),
+            (s.has_vector_info(), "has vector info"),
+            (s.params_on_stack(), "params on stack"),
+        ]
+        .into_iter()
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect()
+    }
+
+    /// Every parsed field as a label/value pair, for display. Fields the table does not
+    /// carry are omitted.
+    pub fn fields(&self) -> Vec<(&'static str, String)> {
+        let s = &self.short;
+        let mut out = vec![
+            (
+                "Language",
+                match s.language() {
+                    Ok(lang) => format!("{lang:?}"),
+                    Err(e) => e.to_string(),
+                },
+            ),
+            ("Fixed parameters", s.get_number_of_fixed_parms().to_string()),
+            ("FP parameters", s.get_number_of_fp_parms().to_string()),
+            ("GPRs saved", s.gpr_regs_saved().to_string()),
+            ("FPRs saved", s.fp_regs_saved().to_string()),
+            ("On-condition directive", s.on_condition_directive().to_string()),
+            ("Table size", format!("{:#X}", self.size())),
+        ];
+        if let Some(name) = &self.name {
+            out.push(("Name", name.clone()));
+        }
+        if let Some(size) = self.fnc_size {
+            out.push(("Function size", format!("{size:#X}")));
+        }
+        if let Some(parm_info) = self.parm_info {
+            out.push(("Parameter info", format!("{parm_info:#010X}")));
+        }
+        if let Some(hand_mask) = self.hand_mask {
+            out.push(("Handler mask", format!("{hand_mask:#010X}")));
+        }
+        if let Some(anchors) = &self.ctl_info {
+            out.push(("Controlled storage", format!("{} anchor(s)", anchors.len())));
+        }
+        if let Some(reg) = self.alloca_reg {
+            out.push(("Alloca register", format!("r{reg}")));
+        }
+        let flags = self.flags();
+        out.push(("Flags", if flags.is_empty() { "none".to_string() } else { flags.join(", ") }));
+        out
+    }
+}

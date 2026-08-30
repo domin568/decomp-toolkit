@@ -30,7 +30,7 @@ const SECTION_HEADER_SIZE: usize = 28;
 const NO_SECTION_NAME: u32 = 0xFFFF_FFFF;
 
 #[inline]
-fn be_u32(data: &[u8], offset: usize) -> Result<u32> {
+pub(crate) fn be_u32(data: &[u8], offset: usize) -> Result<u32> {
     let b = data
         .get(offset..offset + 4)
         .ok_or_else(|| anyhow!("PEF: read past end of file at {:#X}", offset))?;
@@ -38,7 +38,7 @@ fn be_u32(data: &[u8], offset: usize) -> Result<u32> {
 }
 
 #[inline]
-fn be_u16(data: &[u8], offset: usize) -> Result<u16> {
+pub(crate) fn be_u16(data: &[u8], offset: usize) -> Result<u16> {
     let b = data
         .get(offset..offset + 2)
         .ok_or_else(|| anyhow!("PEF: read past end of file at {:#X}", offset))?;
@@ -46,8 +46,18 @@ fn be_u16(data: &[u8], offset: usize) -> Result<u16> {
 }
 
 #[inline]
-fn u8_at(data: &[u8], offset: usize) -> Result<u8> {
+pub(crate) fn u8_at(data: &[u8], offset: usize) -> Result<u8> {
     data.get(offset).copied().ok_or_else(|| anyhow!("PEF: read past end of file at {:#X}", offset))
+}
+
+/// Read a NUL-terminated string at `offset` within the byte range `table`.
+pub(crate) fn cstr_at(data: &[u8], table: (usize, usize), offset: u32) -> Result<&str> {
+    let (start, end) = table;
+    let begin = start.checked_add(offset as usize).context("Invalid PEF string offset")?;
+    let bytes = data.get(begin..end).ok_or_else(|| anyhow!("Invalid PEF string offset"))?;
+    let nul =
+        bytes.iter().position(|&b| b == 0).ok_or_else(|| anyhow!("Unterminated PEF string"))?;
+    std::str::from_utf8(&bytes[..nul]).map_err(|_| anyhow!("Non UTF-8 PEF string"))
 }
 
 /// The container header, located at offset 0.
@@ -147,6 +157,28 @@ impl PefSectionKind {
             v => bail!("Unknown PEF section kind {}", v),
         })
     }
+
+    /// Whether the section holds code or data that is loaded into memory.
+    pub fn is_instantiated(self) -> bool {
+        matches!(
+            self,
+            Self::Code | Self::UnpackedData | Self::PatternInitializedData | Self::ExecutableData
+        )
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::UnpackedData => "unpacked data",
+            Self::PatternInitializedData => "pattern-initialized data",
+            Self::Constant => "constant",
+            Self::Loader => "loader",
+            Self::Debug => "debug",
+            Self::ExecutableData => "executable data",
+            Self::Exception => "exception",
+            Self::Traceback => "traceback",
+        }
+    }
 }
 
 /// One entry of the section header array, which begins immediately after the container header.
@@ -213,16 +245,51 @@ fn section_name(data: &[u8], name_table: (usize, usize), name_offset: u32) -> Re
     if name_offset == NO_SECTION_NAME {
         return Ok("");
     }
-    let (start, end) = name_table;
-    let begin = start.checked_add(name_offset as usize).context("Invalid PEF section name offset")?;
-    let bytes = data
-        .get(begin..end)
-        .ok_or_else(|| anyhow!("Invalid PEF section name offset"))?;
-    let nul = bytes
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or_else(|| anyhow!("Invalid PEF section name offset"))?;
-    std::str::from_utf8(&bytes[..nul]).map_err(|_| anyhow!("Non UTF-8 PEF section name"))
+    cstr_at(data, name_table, name_offset).context("Reading PEF section name")
+}
+
+/// A parsed PEF container: the header, the section table, and the section names.
+#[derive(Debug, Clone)]
+pub struct PefFile {
+    pub header: PefContainerHeader,
+    pub sections: Vec<PefSectionHeader>,
+    /// One name per section, empty for unnamed sections.
+    pub names: Vec<String>,
+}
+
+impl PefFile {
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        let header = PefContainerHeader::parse(data)?;
+        let sections = parse_section_headers(data, &header)?;
+        let name_table = header.name_table_range(&sections);
+        let names = sections
+            .iter()
+            .map(|s| section_name(data, name_table, s.name_offset).map(str::to_string))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { header, sections, names })
+    }
+
+    /// The instantiated contents of every section, in section order, with
+    /// pattern-initialized sections expanded.
+    pub fn section_data(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.sections
+            .iter()
+            .map(|section| {
+                let start = section.container_offset as usize;
+                let end = start
+                    .checked_add(section.packed_size as usize)
+                    .context("Invalid PEF section offset or size")?;
+                let raw = data
+                    .get(start..end)
+                    .ok_or_else(|| anyhow!("Invalid PEF section offset or size"))?;
+                match section.section_kind {
+                    PefSectionKind::PatternInitializedData => pef_decompress::decompress(raw)
+                        .context("Failed to decompress PEF pattern-initialized data section"),
+                    _ => Ok(raw.to_vec()),
+                }
+            })
+            .collect()
+    }
 }
 
 /// Map a PEF section kind onto decomp-toolkit's section kind.
@@ -238,51 +305,26 @@ fn obj_section_kind(kind: PefSectionKind) -> Result<ObjSectionKind> {
 }
 
 pub fn process_pef(buf: &[u8], name: &str) -> Result<ObjInfo> {
-    let header = PefContainerHeader::parse(buf)?;
-    let section_headers = parse_section_headers(buf, &header)?;
-    let name_table = header.name_table_range(&section_headers);
+    let pef = PefFile::parse(buf)?;
+    let contents = pef.section_data(buf)?;
 
+    // PEF sections carry no load address of their own here, so lay the instantiated ones
+    // out consecutively in a synthetic address space.
     const VIRT_ADDR_START: u32 = 0x1000;
     let mut virt_addr_off = VIRT_ADDR_START;
-    let mut sections = Vec::with_capacity(section_headers.len());
-    for section  in &section_headers {
-        if section.section_kind != PefSectionKind::Code &&
-           section.section_kind != PefSectionKind::UnpackedData &&
-           section.section_kind != PefSectionKind::PatternInitializedData &&
-           section.section_kind != PefSectionKind::ExecutableData {
-           continue;
-        }
-
-        let kind = obj_section_kind(section.section_kind)?;
-        let section_name = section_name(buf, name_table, section.name_offset)?;
-
-        let start = section.container_offset as usize;
-        let end = start
-            .checked_add(section.packed_size as usize)
-            .context("Invalid PEF section offset or size")?;
-
-        let data = match section.section_kind {
-            PefSectionKind::PatternInitializedData => {
-                pef_decompress::decompress(buf.get(start..end).ok_or_else(|| anyhow!("Invalid PEF section offset or size"))?)
-                    .context("Failed to decompress PEF pattern-initialized data section")?
-            }
-            _ => {
-                buf.get(start..end)
-                    .ok_or_else(|| anyhow!("Invalid PEF section offset or size"))?
-                    .to_vec()
-            }
-        };
-
+    let mut sections = Vec::with_capacity(pef.sections.len());
+    for ((section, section_name), data) in
+        pef.sections.iter().zip(&pef.names).zip(contents).filter(|((s, _), _)| s.section_kind.is_instantiated())
+    {
         ensure!(section.alignment < 6, "Unsupported PEF section alignment {}", section.alignment);
-        let align = 2u64 << section.alignment;
 
         sections.push(ObjSection {
-            name: section_name.to_string(),
-            kind,
+            name: section_name.clone(),
+            kind: obj_section_kind(section.section_kind)?,
             address: virt_addr_off as u64,
             size: section.unpacked_size as u64,
             data,
-            align,
+            align: 2u64 << section.alignment,
             elf_index: 0,
             relocations: Default::default(),
             virtual_address: Some(virt_addr_off as u64),

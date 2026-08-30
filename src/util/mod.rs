@@ -20,6 +20,8 @@ pub mod nlzss;
 pub mod path;
 pub mod pef;
 pub mod pef_decompress;
+pub mod pef_loader;
+pub mod pef_relocations;
 pub mod pef_tbtab;
 pub mod rarc;
 pub mod read;
